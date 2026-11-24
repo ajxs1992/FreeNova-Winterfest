@@ -1,0 +1,61 @@
+; FreeNova Advertisement Rotator Configuration
+; File: addons/amxmodx/configs/freenova/ads.ini
+; Loaded by freenova_ads.amxx at map start. Reload live from server console
+; (ADMIN_RCON): fnads_reload  -  in chat: /adsreload
+;
+; Format - one ad per line:
+;   <type> | <text>
+;   type = chat | hud | both   (case-insensitive; the text may contain '|')
+;
+; Rules:
+;   - Blank lines and lines starting with ';' or '#' are ignored.
+;   - Chat ads: color codes work (^1 grey, ^2 green, ^3 red, ^4 team color).
+;     The ^4[FreeNova]^1 tag is prepended unless fnads_tag 0.
+;   - HUD ads: one color for the whole message (fnads_color).
+;     Line breaks: use ^n or \n. Do NOT use ^1-^4 in HUD ads - those are
+;     chat-line codes, the HUD takes its color from fnads_color.
+;   - \n typed in a chat ad becomes a space (chat cannot wrap lines).
+;   - Keep chat ads at ~180 characters or less; longer text is truncated by
+;     the engine (the plugin logs a warning when loading such a line).
+;
+; Cvars (defaults):
+;   fnads_enabled     1     0 pauses rotation (the timer keeps running)
+;   fnads_interval    90    seconds between ads (min 10; 0 stops until reload)
+;   fnads_start_delay 30    seconds after map cfg before the first ad
+;   fnads_channel     2     HUD channel - 1 or 2 only (3 is freenova_hud)
+;   fnads_x           -1.0  HUD x (-1.0 = centered)
+;   fnads_y           0.72  HUD y - avoid 0.22 (ReGameDLL MVP text) and
+;                           0.20 (imessage) / 0.18 (freenova_hud)
+;   fnads_hold        7.0   HUD hold time in seconds
+;   fnads_color       54 222 171   "RRR GGG BBB", Eagle teal #36DEAB
+;   fnads_random      0     1 = random order, never twice the same ad in a row
+;   fnads_tag         1     prepend ^4[FreeNova]^1 to chat ads
+;
+; Coexistence (keep until cutover - this plugin never disables them):
+;   scrollmsg (HUD ch2 @ y0.90, 600s; re-renders every 0.3s so it wins any
+;   overlap), imessage (auto channel, y0.20, 180s), freenova_hud (ch3),
+;   mapchooser / nextmap / timeleft.
+; No vault involved: rotation state is in-memory, freenova_bp is never
+; touched, no menabp_* calls are made.
+
+; ---------------------------------------------------------------
+; Advertisements
+; ---------------------------------------------------------------
+
+chat | Join our Discord: discord.gg/dqrWHhQykp - news, events and support!
+
+hud  | Fast downloads on fn-gaming.net\nMissing maps, sprays and sound mods install automatically
+
+chat | Need gear or skills? Type /shop in chat to open the store.
+
+chat | Want perks? Type /vip to see VIP tiers, benefits and the armory.
+
+chat | Check your progress with /rank - level, XP, leaderboard and unlocks in one place.
+
+hud  | Quick commands: /shop  /vip  /rank  /panel
+
+chat | Web panel on the go: type /panel to open the FreeNova panel in your browser.
+
+chat | Website + fastdl: fn-gaming.net - missing files download from our fastdl automatically.
+
+both | Tell a friend about FreeNova - and grab your role on discord.gg/dqrWHhQykp!

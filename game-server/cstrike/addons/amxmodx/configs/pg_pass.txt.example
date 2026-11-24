@@ -1,0 +1,4 @@
+# Copy this file to pg_pass.txt (same folder) and put ONLY the
+# Postgres password on the first line. No quotes, no spaces.
+# Never share this file. Never commit it anywhere.
+CHANGE-ME

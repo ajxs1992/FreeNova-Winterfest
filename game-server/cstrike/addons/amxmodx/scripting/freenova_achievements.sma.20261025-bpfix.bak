@@ -1,0 +1,632 @@
+#include <amxmodx>
+#include <amxmisc>
+#include <cstrike>
+#include <csx>
+#include <nvault>
+#include <crxranks>
+#include <ranksultimate>
+#include <menabp>
+#include <freenova_ui>
+#include <freenova_web>
+#include <rsu>
+#include <freenova_achievements>
+
+native fn_hub_open(id)
+
+#define PLUGIN  "FreeNova Achievements"
+#define VERSION "1.0.0"
+#define AUTHOR  "FreeNova"
+
+// 56400, not 54000. VIP late-load already uses id+54000. Same id cancels the other plugin.
+#define TASK_LATELOAD  56400
+// MEDIUM-2: unpaid achievement coins retry ticker (56500 = missions TASK_PERIOD).
+#define TASK_WALLET_FLUSH  56600
+#define MAX_PLAYERS    32
+
+new g_VaultBP = INVALID_HANDLE
+new bool:g_bPaused
+new bool:g_bAchLoaded[MAX_PLAYERS + 1]
+new g_iAchUnlocked[MAX_PLAYERS + 1]
+new g_iAchLifetimeKills[MAX_PLAYERS + 1]
+new g_iAchLifetimeHS[MAX_PLAYERS + 1]
+new g_iAchLifetimePlants[MAX_PLAYERS + 1]
+new g_iAchLifetimeDefuses[MAX_PLAYERS + 1]
+new g_iAchLifetimeWins[MAX_PLAYERS + 1]
+new g_iAchLifetimeRevives[MAX_PLAYERS + 1]
+new g_iAchStreakBest[MAX_PLAYERS + 1]
+new g_iLifeStreak[MAX_PLAYERS + 1]
+new g_iAchPending[MAX_PLAYERS + 1]
+new g_iAchPendingCoins[MAX_PLAYERS + 1]
+new g_iAchXpPending[MAX_PLAYERS + 1]
+
+public plugin_natives()
+{
+	register_library("freenova_achievements")
+	set_native_filter("FnachNativeFilter")
+	register_native("fnach_get_unlocked", "native_get_unlocked")
+	register_native("fnach_get_count", "native_get_count")
+	register_native("fnach_get_stat", "native_get_stat")
+	register_native("fnach_show", "native_show")
+	register_native("fnach_note_revive", "native_note_revive")
+	register_native("fnach_is_loaded", "native_is_loaded")
+}
+
+public FnachNativeFilter(const name[], index, trap)
+{
+	if (equal(name, "menabp_add_coins")
+		|| equal(name, "menabp_add_xp_once")
+		|| equal(name, "menabp_is_ready")
+		|| equal(name, "menabp_get_tier")
+		|| equal(name, "menabp_get_coins")
+		|| equal(name, "fn_hub_open")
+		|| equal(name, "rsu_get_prestige")
+		|| equal(name, "rsu_get_user_kills")
+		|| equal(name, "rsu_get_user_headshots"))
+		return PLUGIN_HANDLED
+	return PLUGIN_CONTINUE
+}
+
+public plugin_init()
+{
+	register_plugin(PLUGIN, VERSION, AUTHOR)
+
+	if (LibraryExists("rsu_achievements", LibType_Library))
+	{
+		g_bPaused = true
+		log_amx("[FreeNova] rsu_achievements loaded — pausing fnach grants")
+	}
+
+	g_VaultBP = nvault_open("freenova_bp")
+	if (g_VaultBP == INVALID_HANDLE)
+		log_amx("[FreeNova] achievements: nvault freenova_bp failed to open")
+
+	register_clcmd("say /achievements", "Cmd_Achievements")
+	register_clcmd("say_team /achievements", "Cmd_Achievements")
+	register_clcmd("say /ach", "Cmd_Achievements")
+	register_clcmd("say_team /ach", "Cmd_Achievements")
+	register_clcmd("say /medals", "Cmd_Achievements")
+	register_clcmd("say_team /medals", "Cmd_Achievements")
+}
+
+public plugin_end()
+{
+		// freenova_bp is a shared global nVault handle. battlepass_core is the
+	// sole closer; consumer closes here raced it at map end (Invalid vault id).
+}
+
+public client_putinserver(id)
+{
+	ResetClient(id)
+	if (is_user_bot(id))
+		return
+
+	new szAuth[40]
+	get_user_authid(id, szAuth, charsmax(szAuth))
+	if (!szAuth[0] || equal(szAuth, "STEAM_ID_PENDING") || equal(szAuth, "UNKNOWN"))
+	{
+		set_task(5.0, "Task_LateLoad", id + TASK_LATELOAD)
+		return
+	}
+	LoadAchievements(id)
+}
+
+public Task_LateLoad(taskid)
+{
+	new id = taskid - TASK_LATELOAD
+	if (!is_user_connected(id) || is_user_bot(id))
+		return
+
+	new szAuth[40]
+	get_user_authid(id, szAuth, charsmax(szAuth))
+	if (!szAuth[0] || equal(szAuth, "STEAM_ID_PENDING") || equal(szAuth, "UNKNOWN"))
+	{
+		set_task(3.0, "Task_LateLoad", id + TASK_LATELOAD)
+		return
+	}
+	LoadAchievements(id)
+}
+
+public client_disconnected(id)
+{
+	remove_task(id + TASK_LATELOAD)
+	remove_task(id + TASK_WALLET_FLUSH)
+	if (g_bAchLoaded[id] && !is_user_bot(id))
+		SaveAchievements(id)
+	ResetClient(id)
+}
+
+ResetClient(id)
+{
+	g_bAchLoaded[id] = false
+	g_iAchUnlocked[id] = 0
+	g_iAchLifetimeKills[id] = 0
+	g_iAchLifetimeHS[id] = 0
+	g_iAchLifetimePlants[id] = 0
+	g_iAchLifetimeDefuses[id] = 0
+	g_iAchLifetimeWins[id] = 0
+	g_iAchLifetimeRevives[id] = 0
+	g_iAchStreakBest[id] = 0
+	g_iLifeStreak[id] = 0
+	g_iAchPending[id] = 0
+	g_iAchPendingCoins[id] = 0
+	g_iAchXpPending[id] = 0
+}
+
+GetVaultKey(id, output[], len)
+{
+	new authid[40]
+	get_user_authid(id, authid, charsmax(authid))
+	for (new i = 0; authid[i]; i++)
+	{
+		if (authid[i] == ':')
+			authid[i] = '_'
+	}
+	formatex(output, len, "ach#%s", authid)
+}
+
+LoadAchievements(id)
+{
+	g_bAchLoaded[id] = false
+	if (g_VaultBP == INVALID_HANDLE)
+		return
+
+	new key[64], value[128]
+	GetVaultKey(id, key, charsmax(key))
+	if (!nvault_get(g_VaultBP, key, value, charsmax(value)))
+	{
+		g_iAchUnlocked[id] = 0
+		g_iAchLifetimeKills[id] = 0
+		g_iAchLifetimeHS[id] = 0
+		g_iAchLifetimePlants[id] = 0
+		g_iAchLifetimeDefuses[id] = 0
+		g_iAchLifetimeWins[id] = 0
+		g_iAchLifetimeRevives[id] = 0
+		g_iAchStreakBest[id] = 0
+		g_iAchPendingCoins[id] = 0
+		g_iAchXpPending[id] = 0
+		if (LibraryExists("rsu_core", LibType_Library))
+		{
+			g_iAchLifetimeKills[id] = rsu_get_user_kills(id)
+			g_iAchLifetimeHS[id] = rsu_get_user_headshots(id)
+			if (g_iAchLifetimeKills[id] || g_iAchLifetimeHS[id])
+				SaveAchievements(id)
+		}
+		g_bAchLoaded[id] = true
+		UnlockAchievementsFromStats(id)
+		return
+	}
+
+	new part[16], left[128]
+	copy(left, charsmax(left), value)
+	strtok(left, part, charsmax(part), left, charsmax(left), ' ')
+	g_iAchUnlocked[id] = str_to_num(part)
+	strtok(left, part, charsmax(part), left, charsmax(left), ' ')
+	g_iAchLifetimeKills[id] = str_to_num(part)
+	strtok(left, part, charsmax(part), left, charsmax(left), ' ')
+	g_iAchLifetimeHS[id] = str_to_num(part)
+	strtok(left, part, charsmax(part), left, charsmax(left), ' ')
+	g_iAchLifetimePlants[id] = str_to_num(part)
+	strtok(left, part, charsmax(part), left, charsmax(left), ' ')
+	g_iAchLifetimeDefuses[id] = str_to_num(part)
+	strtok(left, part, charsmax(part), left, charsmax(left), ' ')
+	g_iAchLifetimeWins[id] = str_to_num(part)
+	strtok(left, part, charsmax(part), left, charsmax(left), ' ')
+	g_iAchLifetimeRevives[id] = str_to_num(part)
+	strtok(left, part, charsmax(part), left, charsmax(left), ' ')
+	g_iAchStreakBest[id] = str_to_num(part)
+	// MEDIUM-2: 9th blob field = unpaid achievement coins awaiting the
+	// wallet-ready retry. 10th field = BP XP pending bitmask. Legacy 8/9-field
+	// saves have no trailing token, so both load as 0 (nothing pending).
+	g_iAchPendingCoins[id] = 0
+	g_iAchXpPending[id] = 0
+	if (left[0])
+	{
+		strtok(left, part, charsmax(part), left, charsmax(left), ' ')
+		g_iAchPendingCoins[id] = str_to_num(part)
+		if (left[0])
+			g_iAchXpPending[id] = str_to_num(left)
+	}
+
+	g_bAchLoaded[id] = true
+	UnlockAchievementsFromStats(id)
+}
+
+SaveAchievements(id)
+{
+	if (g_VaultBP == INVALID_HANDLE || !g_bAchLoaded[id])
+		return
+	new key[64], value[128]
+	GetVaultKey(id, key, charsmax(key))
+	formatex(value, charsmax(value), "%d %d %d %d %d %d %d %d %d %d",
+		g_iAchUnlocked[id], g_iAchLifetimeKills[id], g_iAchLifetimeHS[id],
+		g_iAchLifetimePlants[id], g_iAchLifetimeDefuses[id],
+		g_iAchLifetimeWins[id], g_iAchLifetimeRevives[id],
+		g_iAchStreakBest[id], g_iAchPendingCoins[id],
+		g_iAchXpPending[id])
+	nvault_set(g_VaultBP, key, value)
+}
+
+GiveAchievement(id, iAch, const szName[], iReward = ACH_COIN_REWARD)
+{
+	if (g_bPaused || !g_bAchLoaded[id])
+		return
+	if (g_iAchUnlocked[id] & (1 << iAch))
+		return
+
+	g_iAchUnlocked[id] |= (1 << iAch)
+	SaveAchievements(id)
+	// Fail-safe: never announce a coin reward that was not actually paid.
+	// menabp_add_coins returns 0 when the wallet is not ready yet
+	// (data not loaded / invalid id), which used to be swallowed silently.
+	// Achievement still unlocks; the "+N Coins" line only shows when the
+	// deposit succeeded.
+	new bool:bPaid = false
+	if (iReward > 0 && LibraryExists("menabp", LibType_Library))
+	{
+		if (menabp_is_ready(id) && menabp_add_coins(id, iReward) != 0)
+			bPaid = true
+		else
+			log_amx("[FreeNova] Achievement %d coin reward NOT paid to id %d (%d coins): wallet not ready or native refused", iAch, id, iReward)
+	}
+
+	// Achievements feed the separate BP ledger, not RSU rank XP. The award id
+	// is stable per achievement and season, so retries cannot double-pay.
+	new bool:bXpPaid = false
+	new iXpAwarded = 0
+	if (LibraryExists("menabp", LibType_Library))
+	{
+		if (menabp_is_ready(id))
+		{
+			new szAward[32]
+			formatex(szAward, charsmax(szAward), "ach#%d", iAch)
+			iXpAwarded = menabp_add_xp_once(id, ACH_XP_REWARD, szAward)
+			if (iXpAwarded >= 0)
+				bXpPaid = true
+			else
+				log_amx("[FreeNova] Achievement %d BP XP NOT paid to id %d (%d BP XP): native refused", iAch, id, ACH_XP_REWARD)
+		}
+	}
+	if (!bXpPaid)
+	{
+		g_iAchXpPending[id] |= (1 << iAch)
+		SaveAchievements(id)
+		EnsureCoinFlush(id)
+	}
+
+	g_iAchPending[id]++
+	if (g_iAchPending[id] == 1)
+	{
+		if (bPaid && iXpAwarded > 0)
+			client_printcolor(id, "!g[FreeNova] !n Achievement unlocked: !t%s!n! (+!g%d Coins!n, +!g%d BP XP!n)", szName, iReward, iXpAwarded)
+		else if (bPaid)
+			client_printcolor(id, "!g[FreeNova] !n Achievement unlocked: !t%s!n! (+!g%d Coins!n)", szName, iReward)
+		else if (iXpAwarded > 0)
+			client_printcolor(id, "!g[FreeNova] !n Achievement unlocked: !t%s!n! (+!g%d BP XP!n)", szName, iXpAwarded)
+		else
+			client_printcolor(id, "!g[FreeNova] !n Achievement unlocked: !t%s!n", szName)
+	}
+	if (iReward > 0 && !bPaid)
+	{
+		// MEDIUM-2: the unpaid reward becomes a vault-persisted pending
+		// marker, retried once the wallet reports ready. The unlock bit
+		// above stays one-shot — only the coin payment retries.
+		g_iAchPendingCoins[id] += iReward
+		SaveAchievements(id)
+		EnsureCoinFlush(id)
+	}
+}
+
+// Pays the pending-achievement-coins marker once the wallet is ready.
+// Returns the amount still owed after the attempt (0 = nothing pending).
+FlushPendingCoins(id)
+{
+	if (!g_bAchLoaded[id] || g_iAchPendingCoins[id] <= 0)
+		return 0
+	if (!LibraryExists("menabp", LibType_Library))
+		return g_iAchPendingCoins[id]
+	if (!menabp_is_ready(id))
+		return g_iAchPendingCoins[id]
+	new iAmount = g_iAchPendingCoins[id]
+	if (menabp_add_coins(id, iAmount) == 0)
+	{
+		// Wallet claims ready but refused the deposit — keep the marker and
+		// let the retry task try again (logged once per attempt, not per kill).
+		log_amx("[FreeNova] Pending achievement coins NOT paid to id %d (%d coins): menabp_add_coins refused", id, iAmount)
+		return iAmount
+	}
+	g_iAchPendingCoins[id] = 0
+	SaveAchievements(id)
+	client_printcolor(id, "!g[FreeNova] !n +!g%d Coins !n from earlier achievements credited.", iAmount)
+	return 0
+}
+
+// Retries BP XP only for achievements whose payout failed. The pending set is
+// a persisted bitmask, so older unlocks are not retroactively paid. Award ids
+// are stable, so a crash after credit cannot double-pay.
+// Returns true while XP is still pending (wallet not ready / native refused).
+bool:FlushPendingXp(id)
+{
+	if (!g_bAchLoaded[id] || g_iAchXpPending[id] == 0)
+		return false
+	if (!LibraryExists("menabp", LibType_Library))
+		return true
+	if (!menabp_is_ready(id))
+		return true
+
+	new iCredited = 0
+	for (new i = 0; i < ACH_COUNT; i++)
+	{
+		if (!(g_iAchXpPending[id] & (1 << i)))
+			continue
+		new szAward[32]
+		formatex(szAward, charsmax(szAward), "ach#%d", i)
+		new iXp = menabp_add_xp_once(id, ACH_XP_REWARD, szAward)
+		if (iXp < 0)
+			continue
+		if (iXp > 0)
+			iCredited += iXp
+		g_iAchXpPending[id] = g_iAchXpPending[id] & ~(1 << i)
+	}
+	SaveAchievements(id)
+	if (iCredited > 0)
+		client_printcolor(id, "!g[FreeNova] !n +!g%d BP XP !n from earlier achievements credited.", iCredited)
+	return (g_iAchXpPending[id] != 0)
+}
+
+EnsureCoinFlush(id)
+{
+	if (!g_bAchLoaded[id] || (g_iAchPendingCoins[id] <= 0 && g_iAchXpPending[id] == 0))
+		return
+	if (!task_exists(id + TASK_WALLET_FLUSH))
+		set_task(15.0, "Task_FlushCoins", id + TASK_WALLET_FLUSH, "", 0, "b")
+}
+
+public Task_FlushCoins(taskid)
+{
+	new id = taskid - TASK_WALLET_FLUSH
+	if (!is_user_connected(id) || is_user_bot(id) || !g_bAchLoaded[id])
+	{
+		remove_task(taskid)
+		return
+	}
+	new bool:bCoins = (FlushPendingCoins(id) > 0)
+	new bool:bXp = FlushPendingXp(id)
+	if (!bCoins && !bXp)
+		remove_task(taskid)
+}
+
+UnlockAchievementsFromStats(id)
+{
+	if (g_bPaused || !g_bAchLoaded[id])
+		return
+
+	if (LibraryExists("rsu_core", LibType_Library))
+	{
+		new iRankKills = rsu_get_user_kills(id);
+		new iRankHS = rsu_get_user_headshots(id);
+		if (iRankKills > g_iAchLifetimeKills[id])
+			g_iAchLifetimeKills[id] = iRankKills;
+		if (iRankHS > g_iAchLifetimeHS[id])
+			g_iAchLifetimeHS[id] = iRankHS;
+	}
+
+	g_iAchPending[id] = 0
+	if (g_iAchLifetimeKills[id] >= 100)  GiveAchievement(id, ACH_KILLS_100,  "First Blood Century")
+	if (g_iAchLifetimeKills[id] >= 1000) GiveAchievement(id, ACH_KILLS_1000, "Killing Machine")
+	if (g_iAchLifetimeKills[id] >= 5000) GiveAchievement(id, ACH_KILLS_5000, "FreeNova Legend Killer", 500)
+	if (g_iAchLifetimeHS[id] >= 100)     GiveAchievement(id, ACH_HS_100,     "Sharpshooter")
+	if (g_iAchLifetimeHS[id] >= 500)     GiveAchievement(id, ACH_HEADS_500,  "Headhunter", 500)
+	if (g_iAchLifetimePlants[id] >= 50)  GiveAchievement(id, ACH_PLANTS_50,  "Demolition Expert")
+	if (g_iAchLifetimeDefuses[id] >= 25) GiveAchievement(id, ACH_DEFUSES_25, "Bomb Squad")
+	if (g_iAchLifetimeWins[id] >= 100)   GiveAchievement(id, ACH_WINS_100,   "Team Player")
+
+	// BP-level achievements follow the BP ledger. Fall back to rank only while
+	// battlepass_core is still loading (legacy behaviour for a fresh join).
+	new iLevel = 0
+	if (LibraryExists("menabp", LibType_Library) && menabp_is_ready(id))
+		iLevel = menabp_get_tier(id)
+	else
+		iLevel = crxranks_get_user_level(id)
+	if (iLevel >= 52)      GiveAchievement(id, ACH_LEVEL_52, "FreeNova Legend", 1000)
+	else if (iLevel >= 26) GiveAchievement(id, ACH_LEVEL_26, "Seasoned Soldier")
+
+	new iPrestige = 0
+	if (LibraryExists("rsu_core", LibType_Library))
+		iPrestige = rsu_get_prestige(id)
+	if (iPrestige >= 1) GiveAchievement(id, ACH_PRESTIGE_1, "Prestigious")
+	if (g_iAchStreakBest[id] >= 10) GiveAchievement(id, ACH_STREAK_10, "Unstoppable", 500)
+
+	new iCoins = 0
+	if (LibraryExists("menabp", LibType_Library))
+		iCoins = menabp_get_coins(id)
+	if (iCoins >= 10000) GiveAchievement(id, ACH_COINS_10000, "Coin Magnet")
+	if (g_iAchLifetimeRevives[id] >= 25) GiveAchievement(id, ACH_REVIVER, "Combat Medic", 500)
+
+	if (g_iAchPending[id] > 1)
+		client_printcolor(id, "!g[FreeNova] !n +%d more achievements unlocked this round.", g_iAchPending[id] - 1)
+	g_iAchPending[id] = 0
+	// Opportunistically pay any unpaid achievement rewards on gameplay
+	// events; keep the retry task alive until BOTH coin and BP XP markers drain.
+	if (g_iAchPendingCoins[id] > 0 || g_iAchXpPending[id] != 0)
+	{
+		new bool:bCoins = (g_iAchPendingCoins[id] > 0) ? (FlushPendingCoins(id) > 0) : false
+		new bool:bXp = (g_iAchXpPending[id] != 0) ? FlushPendingXp(id) : false
+		if (!bCoins && !bXp)
+			remove_task(id + TASK_WALLET_FLUSH)
+		else
+			EnsureCoinFlush(id)
+	}
+}
+
+public fn_on_player_kill(attacker, victim, wpnindex, headshot, tk)
+{
+	#pragma unused victim, wpnindex
+	if (g_bPaused || tk)
+		return
+	if (!is_user_connected(attacker) || is_user_bot(attacker) || !g_bAchLoaded[attacker])
+		return
+
+	g_iAchLifetimeKills[attacker]++
+	if (LibraryExists("rsu_core", LibType_Library))
+	{
+		new iRankKills = rsu_get_user_kills(attacker);
+		if (iRankKills > g_iAchLifetimeKills[attacker])
+			g_iAchLifetimeKills[attacker] = iRankKills;
+	}
+	g_iLifeStreak[attacker]++
+	if (g_iLifeStreak[attacker] > g_iAchStreakBest[attacker])
+	{
+		g_iAchStreakBest[attacker] = g_iLifeStreak[attacker]
+		SaveAchievements(attacker)
+	}
+	if (headshot)
+	{
+		g_iAchLifetimeHS[attacker]++
+		if (LibraryExists("rsu_core", LibType_Library))
+		{
+			new iRankHS = rsu_get_user_headshots(attacker);
+			if (iRankHS > g_iAchLifetimeHS[attacker])
+				g_iAchLifetimeHS[attacker] = iRankHS;
+		}
+	}
+	UnlockAchievementsFromStats(attacker)
+}
+
+// RANK_BOTS master switch reader: true only when rsu_core runs RANK_BOTS=1.
+// Bots never load achievement state, so this only opens VICTIM-side counters
+// (streak reset) for humans. Bot PLAYERS earn nothing.
+stock bool:BotCountOn()
+{
+    return LibraryExists("rsu_core", LibType_Library) && rsu_bots_count();
+}
+
+public client_death(attacker, victim, wpnindex, hitplace, TK)
+{
+	#pragma unused attacker, wpnindex, hitplace, TK
+	if (is_user_connected(victim) && (!is_user_bot(victim) || BotCountOn()))
+		g_iLifeStreak[victim] = 0
+}
+
+public fn_on_bomb_event(id, type)
+{
+	if (g_bPaused || !g_bAchLoaded[id])
+		return
+	if (type == 0)
+		g_iAchLifetimePlants[id]++
+	else if (type == 1)
+		g_iAchLifetimeDefuses[id]++
+	else
+		return
+	UnlockAchievementsFromStats(id)
+}
+
+public fn_on_round_win(id, team)
+{
+	#pragma unused team
+	if (g_bPaused || !g_bAchLoaded[id])
+		return
+	g_iAchLifetimeWins[id]++
+	UnlockAchievementsFromStats(id)
+}
+
+public Cmd_Achievements(id)
+{
+	if (!is_user_connected(id))
+		return PLUGIN_HANDLED
+	if (FNWeb_OpenPage(id, "achievements"))
+		return PLUGIN_HANDLED
+	client_printcolor(id, "!g[FreeNova] !nAchievements are unavailable right now - try again in a moment.")
+	return PLUGIN_HANDLED
+}
+
+
+
+
+
+
+
+
+
+bool:ValidId(id)
+{
+	return (1 <= id <= MAX_PLAYERS)
+}
+
+public native_get_unlocked(plugin, params)
+{
+	new id = get_param(1)
+	return ValidId(id) ? g_iAchUnlocked[id] : 0
+}
+
+public native_get_count(plugin, params)
+{
+	new id = get_param(1)
+	if (!ValidId(id))
+		return 0
+	new n
+	for (new i = 0; i < ACH_COUNT; i++)
+	{
+		if (i == ACH_PRESTIGE_1)
+			continue
+		if (g_iAchUnlocked[id] & (1 << i))
+			n++
+	}
+	return n
+}
+
+public native_get_stat(plugin, params)
+{
+	new id = get_param(1)
+	new which = get_param(2)
+	if (!ValidId(id))
+		return 0
+	switch (which)
+	{
+		case 0: return g_iAchLifetimeKills[id]
+		case 1: return g_iAchLifetimeHS[id]
+		case 2: return g_iAchLifetimePlants[id]
+		case 3: return g_iAchLifetimeDefuses[id]
+		case 4: return g_iAchLifetimeWins[id]
+		case 5: return g_iAchLifetimeRevives[id]
+		case 6: return g_iAchStreakBest[id]
+	}
+	return 0
+}
+
+public native_show(plugin, params)
+{
+	new id = get_param(1)
+	if (!ValidId(id) || !is_user_connected(id))
+		return 0
+	if (FNWeb_OpenPage(id, "achievements"))
+		return 1
+	return 0
+}
+
+public native_note_revive(plugin, params)
+{
+	new id = get_param(1)
+	if (!ValidId(id) || !g_bAchLoaded[id])
+		return 0
+	g_iAchLifetimeRevives[id]++
+	UnlockAchievementsFromStats(id)
+	SaveAchievements(id)
+	return g_iAchLifetimeRevives[id]
+}
+
+public native_is_loaded(plugin, params)
+{
+	new id = get_param(1)
+	return (ValidId(id) && g_bAchLoaded[id]) ? 1 : 0
+}
+
+stock client_printcolor(id, const fmt[], any:...)
+{
+	new msg[192]
+	vformat(msg, charsmax(msg), fmt, 3)
+	replace_all(msg, charsmax(msg), "!g", "^4")
+	replace_all(msg, charsmax(msg), "!t", "^3")
+	replace_all(msg, charsmax(msg), "!n", "^1")
+	replace_all(msg, charsmax(msg), "!Team", "^3")
+	client_print_color(id, print_team_default, msg)
+}

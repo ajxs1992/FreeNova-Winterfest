@@ -1,0 +1,252 @@
+#include <amxmodx>
+#include <amxmisc>
+#include <crxranks>
+#include <menabp>
+#include <freenova_vip>
+#include <freenova_prefs>
+#include <freenova_ui>
+#include <freenova_missions>
+
+// Persistent stats HUD — GOLDSrc HUD channel (NOT DHUD).
+// Steam CS 1.6 ignores DHUD packets, so dhud never appeared on your screen.
+// Dedicated channel 3 (not 1, not -1): channel 1 is stolen by auto-channel
+// HUDs (adminchat, miscstats, VIP bullet-dmg); channel 2 is scrollmsg.amxx.
+// Parked under the radar (x=0.01, y=0.18, tunable via fn_hud_x / fn_hud_y).
+
+#define PLUGIN  "FreeNova Rank HUD"
+#define VERSION "3.3"
+#define AUTHOR  "FreeNova"
+
+#define TASK_HUD     31200
+#define HUD_REFRESH  0.40
+#define HUD_CHANNEL  3
+
+new g_iCacheLevel[MAX_PLAYERS + 1]
+new g_iCacheXP[MAX_PLAYERS + 1]
+new g_iCacheNextXP[MAX_PLAYERS + 1]
+new g_iCacheCoins[MAX_PLAYERS + 1]
+new g_iCacheTier[MAX_PLAYERS + 1]
+new g_szCacheRank[MAX_PLAYERS + 1][32]
+new bool:g_bCacheLoaded[MAX_PLAYERS + 1]
+
+new g_pCvarEnabled
+new g_pCvarX
+new g_pCvarY
+
+public plugin_natives()
+{
+    set_native_filter("HudNativeFilter")
+}
+
+public HudNativeFilter(const name[], index, trap)
+{
+    if (equal(name, "fnpref_get") || equal(name, "fnpref_set") || equal(name, "fnpref_is_loaded")
+        || equal(name, "fnvip_get_tier") || equal(name, "fnvip_get_tier_name_raw")
+        || equal(name, "menabp_get_coins")
+        || equal(name, "fnmsn_get_track")
+        || equal(name, "fnmsn_get_status")
+        || equal(name, "fnmsn_get_target")
+        || equal(name, "fnmsn_get_daily_progress")
+        || equal(name, "fnmsn_get_daily2_progress")
+        || equal(name, "fnmsn_get_weekly_progress")
+        || equal(name, "fnmsn_get_vip_progress"))
+        return PLUGIN_HANDLED
+    return PLUGIN_CONTINUE
+}
+
+public plugin_init()
+{
+    register_plugin(PLUGIN, VERSION, AUTHOR)
+
+    register_clcmd("say /hud", "Cmd_Hud")
+    register_clcmd("say_team /hud", "Cmd_Hud")
+    register_clcmd("say /rankhud", "Cmd_Hud")
+    register_clcmd("say_team /rankhud", "Cmd_Hud")
+
+    register_event("ResetHUD", "Event_ResetHUD", "be")
+
+    g_pCvarEnabled = register_cvar("fn_hud_enabled", "1")
+    g_pCvarX       = register_cvar("fn_hud_x", "0.01")
+    g_pCvarY       = register_cvar("fn_hud_y", "0.18")
+
+    set_task(HUD_REFRESH, "Task_RenderHud", TASK_HUD, "", 0, "b")
+}
+
+public plugin_end()
+{
+    remove_task(TASK_HUD)
+}
+
+public Cmd_Hud(id)
+{
+    new iCurrent = 1
+    if (fnpref_is_loaded(id))
+        iCurrent = fnpref_get(id, FNPREF_RANK_HUD)
+
+    new iNew = iCurrent ? 0 : 1
+    if (fnpref_is_loaded(id))
+        fnpref_set(id, FNPREF_RANK_HUD, iNew)
+
+    client_print_color(id, print_team_default, "%s Rank HUD > %s", FN_CHAT_PREFIX, iNew ? "ON" : "OFF")
+    if (iNew)
+        DrawHud(id)
+    return PLUGIN_HANDLED
+}
+
+public client_putinserver(id)
+{
+    g_bCacheLoaded[id] = false
+    g_iCacheLevel[id] = 0
+    g_iCacheXP[id] = 0
+    g_iCacheNextXP[id] = 0
+    g_iCacheCoins[id] = 0
+    g_iCacheTier[id] = 0
+    g_szCacheRank[id][0] = 0
+    client_cmd(id, "hud_draw 1")
+}
+
+public client_disconnected(id)
+{
+    g_bCacheLoaded[id] = false
+}
+
+public Event_ResetHUD(id)
+{
+    if (is_user_connected(id) && !is_user_bot(id) && !is_user_hltv(id))
+        DrawHud(id)
+}
+
+public crxranks_user_loaded(id)
+{
+    if (is_user_connected(id))
+        RefreshCache(id)
+}
+
+public crxranks_user_xp_updated(id)
+{
+    RefreshCache(id)
+}
+
+public crxranks_user_level_updated(id, iLevel, bool:bLevelUp)
+{
+    RefreshCache(id)
+}
+
+RefreshCache(id)
+{
+    if (!(1 <= id <= MaxClients) || !is_user_connected(id))
+        return
+    if (crxranks_is_user_loaded(id))
+    {
+        g_iCacheLevel[id] = crxranks_get_user_level(id)
+        g_iCacheXP[id] = crxranks_get_user_xp(id)
+        g_iCacheNextXP[id] = crxranks_get_user_next_xp(id)
+        crxranks_get_user_rank(id, g_szCacheRank[id], charsmax(g_szCacheRank[]))
+    }
+    g_iCacheCoins[id] = LibraryExists("menabp", LibType_Library) ? menabp_get_coins(id) : 0
+    g_iCacheTier[id] = g_iCacheLevel[id]
+    if (g_iCacheTier[id] > 60)
+        g_iCacheTier[id] = 60
+    g_bCacheLoaded[id] = true
+}
+
+public Task_RenderHud()
+{
+    if (!get_pcvar_num(g_pCvarEnabled))
+        return
+
+    new iPlayers[32], iNum
+    get_players(iPlayers, iNum, "ch")
+    for (new i; i < iNum; i++)
+        DrawHud(iPlayers[i])
+}
+
+DrawHud(id)
+{
+    if (!is_user_connected(id) || is_user_bot(id) || is_user_hltv(id))
+        return
+
+    if (fnpref_is_loaded(id) && fnpref_get(id, FNPREF_RANK_HUD) == 0)
+        return
+
+    if (crxranks_is_user_loaded(id))
+        RefreshCache(id)
+    else
+        g_iCacheCoins[id] = LibraryExists("menabp", LibType_Library) ? menabp_get_coins(id) : 0
+
+    new Float:flX = get_pcvar_float(g_pCvarX)
+    new Float:flY = get_pcvar_float(g_pCvarY)
+
+    // Eagle teal (#36DEAB). Dedicated HUD_CHANNEL. Hold longer than the refresh so it never blanks.
+    set_hudmessage(54, 222, 171, flX, flY, 0, 0.0, 1.1, 0.0, 0.0, HUD_CHANNEL)
+    new szMission[48]
+    szMission[0] = 0
+    if (LibraryExists("freenova_missions", LibType_Library))
+        FormatMissionHud(id, szMission, charsmax(szMission))
+
+    show_hudmessage(id, "FreeNova^nLv %d  %s^nXP %d / %d^n%d coins  BP T%d^n%s%s%s",
+        g_iCacheLevel[id],
+        g_szCacheRank[id][0] ? g_szCacheRank[id] : "-",
+        g_iCacheXP[id],
+        g_iCacheNextXP[id] ? g_iCacheNextXP[id] : g_iCacheXP[id],
+        g_iCacheCoins[id],
+        g_iCacheTier[id],
+        GetStatusLabel(id, fnvip_get_tier(id)),
+        szMission[0] ? "^n" : "",
+        szMission)
+}
+
+FormatMissionHud(id, szOut[], iLen)
+{
+    new szTrack[16]
+    fnmsn_get_track(id, szTrack, charsmax(szTrack))
+    new iGroup = -1, iSlot
+    new iColon = contain(szTrack, ":")
+    if (iColon >= 0)
+    {
+        new szLeft[8]
+        copy(szLeft, charsmax(szLeft), szTrack)
+        szLeft[iColon] = 0
+        iGroup = str_to_num(szLeft)
+        iSlot = str_to_num(szTrack[iColon + 1])
+    }
+    if (iGroup < 0)
+        return
+    new iHave, iNeed = fnmsn_get_target(id, iGroup, iSlot)
+    new iSt = fnmsn_get_status(id, iGroup, iSlot)
+    if (iGroup == 0)
+        iHave = fnmsn_get_daily_progress(id, iSlot)
+    else if (iGroup == 1)
+        iHave = fnmsn_get_daily2_progress(id, iSlot)
+    else if (iGroup == 2)
+        iHave = fnmsn_get_weekly_progress(id, iSlot)
+    else if (iGroup == 3)
+        iHave = fnmsn_get_vip_progress(id)
+    else
+        return
+    if (iSt == 1)
+        formatex(szOut, iLen, "Mission READY")
+    else if (iSt == 2)
+        formatex(szOut, iLen, "Mission claimed")
+    else
+        formatex(szOut, iLen, "Mission %d/%d", iHave, iNeed)
+}
+
+GetStatusLabel(id, iTier)
+{
+    static szLabel[16]
+    // Admin label: AMXX ADMIN_BAN is flag d, part of panel FLAG_ADMIN (cdeijuv).
+    if (get_user_flags(id) & ADMIN_BAN)
+    {
+        copy(szLabel, charsmax(szLabel), "Admin")
+        return szLabel
+    }
+    if (iTier > 0)
+    {
+        fnvip_get_tier_name_raw(iTier, szLabel, charsmax(szLabel))
+        if (szLabel[0])
+            return szLabel
+    }
+    copy(szLabel, charsmax(szLabel), "Member")
+    return szLabel
+}

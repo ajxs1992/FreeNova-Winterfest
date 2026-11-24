@@ -1,0 +1,2692 @@
+#include <amxmodx>
+#include <amxmisc>
+#include <fakemeta>
+#include <cstrike>
+#include <hamsandwich>
+#include <nvault>
+#include <menabp>
+#include <crxranks>
+#include <freenova_vip>
+#include <freenova_ui>
+
+#define PLUGIN  "FreeNova Weapon Skins & Custom Models"
+#define VERSION "5.0"
+#define AUTHOR  "FreeNova Dev"
+
+#define CONFIG_FILE             "skins_menu.cfg"
+#define CUSTOM_SKINS_FILE       "custom_skins.ini"
+#define MASTERY_SKINS_FILE      "mastery_skins.ini"
+#define VAULT_NAME              "freenova_weapon_skins"
+
+#define MAX_PLAYERS             32
+#define MAX_SKINS_PER_GROUP     64
+#define SKIN_NAME_LEN           32
+#define MODEL_PATH_LEN          128
+#define CONFIG_LINE_LEN         256
+#define PLAYER_ID_LEN           64
+#define VAULT_KEY_LEN           96
+#define VAULT_DATA_LEN          256
+// Task IDs must not collide with other plugins' per-player task ranges.
+// battlepass_core uses TASK_SPAWN=7000 and TASK_HUD=8000 (id+base).
+// This plugin uses 7600/7650 to avoid those ranges.
+#define TASK_LOAD_PLAYER        7600
+new g_iLoadPlayerRetries[33];
+#define TASK_SPAWN_MODEL        7650
+
+// Skin gates marked as BP levels must use the BattlePass tier ledger, not the
+// RSU rank level. Fail closed while battlepass_core is still loading.
+stock GetBpLevel(id)
+{
+    // Fail closed: BP-gated skins must never fall back to the separate RSU
+    // rank level. If battlepass_core is absent/not ready, the gate is locked.
+    if (!LibraryExists("menabp", LibType_Library))
+        return 0;
+    if (!menabp_is_ready(id))
+        return 0;
+    return menabp_get_tier(id);
+}
+
+enum _:SkinGroup
+{
+    GROUP_AK47 = 0,
+    GROUP_M4A1,
+    GROUP_DEAGLE,
+    GROUP_AWP,
+    GROUP_KNIFE,
+    GROUP_COUNT
+};
+
+new const g_GroupNames[GROUP_COUNT][] =
+{
+    "AK47 Skins",
+    "M4A1 Skins",
+    "Deagle Skins",
+    "AWP Skins",
+    "Knife Skins"
+};
+
+new const g_DefaultViewModel[GROUP_COUNT][] =
+{
+    "models/v_ak47.mdl",
+    "models/v_m4a1.mdl",
+    "models/v_deagle.mdl",
+    "models/v_awp.mdl",
+    "models/v_knife.mdl"
+};
+
+new const g_DefaultPlayerModel[GROUP_COUNT][] =
+{
+    "models/p_ak47.mdl",
+    "models/p_m4a1.mdl",
+    "models/p_deagle.mdl",
+    "models/p_awp.mdl",
+    "models/p_knife.mdl"
+};
+
+// Premade Player Models
+enum _:PremadePModelInfo
+{
+    PMODEL_NAME[32],
+    PMODEL_FILE[32],
+    PMODEL_TEAM, // 0 = all, 1 = T, 2 = CT
+    PMODEL_PRICE,
+    PMODEL_VIP,
+    PMODEL_LEVEL
+};
+
+new const g_PremadePlayerModels[][PremadePModelInfo] =
+{
+    { "Default CS 1.6 Agent",  "",          0, 0,     0, 0 },
+    { "VIP Guardian (CT)",     "vip_ct",    2, 25000, 1, 0 },
+    { "VIP Syndicate (T)",     "vip_tero",  1, 25000, 1, 0 },
+    { "Legend CT (S1)",        "legend_ct", 2, 0,     0, 52 },
+    { "Legend T (S1)",         "legend_t",  1, 0,     0, 52 },
+    { "S1 Operator (CT)",      "s1_op_ct",  2, 0,     0, 53 },
+    { "S1 Operator (T)",       "s1_op_t",   1, 0,     0, 53 },
+    { "S1 VIP Operator (CT)",  "s1_vip_ct", 2, 0,     2, 56 },
+    { "S1 VIP Operator (T)",   "s1_vip_t",  1, 0,     2, 56 }
+};
+
+new g_ConfigPath[128];
+new g_szCustomSkinsPath[128];
+
+new g_SkinCount[GROUP_COUNT];
+new g_SkinNames[GROUP_COUNT][MAX_SKINS_PER_GROUP][SKIN_NAME_LEN];
+new g_ViewModels[GROUP_COUNT][MAX_SKINS_PER_GROUP][MODEL_PATH_LEN];
+new g_PlayerModels[GROUP_COUNT][MAX_SKINS_PER_GROUP][MODEL_PATH_LEN];
+new g_VipOnly[GROUP_COUNT][MAX_SKINS_PER_GROUP];
+new g_BPLevel[GROUP_COUNT][MAX_SKINS_PER_GROUP];
+new g_CoinPrice[GROUP_COUNT][MAX_SKINS_PER_GROUP];
+
+// Player Data
+new g_SelectedSkin[MAX_PLAYERS + 1][GROUP_COUNT];
+new g_iOwnedMask[MAX_PLAYERS + 1][GROUP_COUNT][2];
+
+// Premade Player Model per player
+new g_szEquippedPlayerModel[MAX_PLAYERS + 1][32];
+new g_iEquippedPlayerTeam[MAX_PLAYERS + 1];
+new g_szEquipT[MAX_PLAYERS + 1][32];
+new g_szEquipCT[MAX_PLAYERS + 1][32];
+new g_iPlayerModelOwned[MAX_PLAYERS + 1];
+
+// Exclusive Owner-Assigned Custom Skins
+new g_szCustomWeaponV[MAX_PLAYERS + 1][GROUP_COUNT][MODEL_PATH_LEN];
+new g_szCustomWeaponP[MAX_PLAYERS + 1][GROUP_COUNT][MODEL_PATH_LEN];
+new g_szCustomPlayerModel[MAX_PLAYERS + 1][32];
+new g_iCustomPlayerTeam[MAX_PLAYERS + 1]; // 0 = all, 1 = T, 2 = CT
+new bool:g_bHasCustomSkinOrder[MAX_PLAYERS + 1];
+new bool:g_bSkinsLoaded[MAX_PLAYERS + 1];
+new g_iPendingBuyGroup[MAX_PLAYERS + 1];
+new g_iPendingBuySkin[MAX_PLAYERS + 1];
+
+// Forced Models from configs/freenova/player_models.ini
+new g_szForcedPlayerModel[MAX_PLAYERS + 1][32];
+new g_iForcedPlayerTeam[MAX_PLAYERS + 1];
+
+new g_Vault = INVALID_HANDLE;
+new g_pCustomOrderCost;
+
+// ============================================================
+// PLUGIN LIFECYCLE & NATIVES
+// ============================================================
+
+public plugin_precache()
+{
+    BuildConfigPath();
+    LoadSkinsConfig();
+    LoadMasterySkinsConfig();
+    PrecacheLoadedModels();
+
+    BuildCustomSkinsPath();
+    LoadAndPrecacheCustomSkins();
+    LoadAndPrecacheForcedModels();
+}
+
+public plugin_init()
+{
+    register_plugin(PLUGIN, VERSION, AUTHOR);
+
+    g_pCustomOrderCost = register_cvar("fn_custom_skin_cost", "50000");
+
+    g_Vault = nvault_open(VAULT_NAME);
+    if (g_Vault == INVALID_HANDLE)
+    {
+        set_fail_state("Failed to open nVault.");
+    }
+
+    RegisterHam(Ham_Spawn, "player", "Hook_PlayerSpawn", 1);
+
+    register_clcmd("say /skins", "CmdOpenSkins");
+    register_clcmd("say_team /skins", "CmdOpenSkins");
+    register_clcmd("say /models", "CmdOpenModels");
+    register_clcmd("say_team /models", "CmdOpenModels");
+    register_clcmd("say /customskin", "Cmd_CustomSkinCmd");
+    register_clcmd("say_team /customskin", "Cmd_CustomSkinCmd");
+    register_clcmd("say /customskins", "Cmd_CustomSkinCmd");
+    register_clcmd("say_team /customskins", "Cmd_CustomSkinCmd");
+
+    register_concmd("fn_set_skin", "Cmd_AdminSetSkin", ADMIN_RCON, "<target> <weapon|player> <group|team> <v_model|model> [p_model]");
+    register_concmd("fn_remove_skin", "Cmd_AdminRemoveSkin", ADMIN_RCON, "<target> [weapon|player|all]");
+    register_concmd("fn_list_skins", "Cmd_AdminListSkins", ADMIN_RCON, "- List all assigned custom skins");
+    register_concmd("fn_skin_orders", "Cmd_AdminSkinOrders", ADMIN_BAN, "- List custom skin orders");
+
+    register_event("CurWeapon", "EventCurWeapon", "be", "1=1");
+}
+
+public plugin_natives()
+{
+    register_library("weapon_models");
+    register_native("skins_open_menu", "native_open", 0);
+    register_native("fn_has_custom_model", "native_has_custom_model", 0);
+
+    register_native("fn_models_get_equipped", "_native_models_get_equipped", 0);
+    register_native("fn_models_set_equipped", "_native_models_set_equipped", 0);
+    register_native("fn_models_is_forced", "_native_models_is_forced", 0);
+
+    register_native("fn_skins_get_equipped", "_native_skins_get_equipped", 0);
+    register_native("fn_skins_set_equipped", "_native_skins_set_equipped", 0);
+    register_native("fn_skins_is_owned", "_native_skins_is_owned", 0);
+    register_native("fn_skins_unlock", "_native_skins_unlock", 0);
+    register_native("fn_skins_unlock_model", "_native_skins_unlock_model", 0);
+    register_native("fn_skins_get_count", "_native_skins_get_count", 0);
+    register_native("fn_skins_get_name", "_native_skins_get_name", 0);
+    register_native("fn_skins_get_price", "_native_skins_get_price", 0);
+    register_native("fn_models_get_price", "_native_models_get_price", 0);
+    register_native("fn_models_is_owned", "_native_models_is_owned", 0);
+    register_native("fn_models_unlock", "_native_models_unlock", 0);
+    register_native("fn_skins_can_buy", "_native_skins_can_buy", 0);
+    register_native("fn_models_can_buy", "_native_models_can_buy", 0);
+}
+
+stock bool:WmValidClient(id)
+{
+    return (1 <= id <= MAX_PLAYERS) && bool:is_user_connected(id);
+}
+
+// Single choke point for every menu_display path. menu_display() raises
+// runtime error 10 "Player %d is not in game" when !pPlayer->ingame (see
+// newmenus.cpp). AMXX's is_user_connected() returns exactly that flag, so
+// it is the sufficient guard; is_user_in_game() is a SourceMod native and
+// does not exist in AMXX 1.10. Crash vector: on disconnect AMXX fires menu
+// handlers with MENU_EXIT, and the re-display paths (e.g. SkinMenuHandler,
+// CustomStatusMenuHandler -> ShowMainMenu) used to call menu_display after
+// the slot was already out of game (error_20261010.log). Destroy the menu
+// instead of leaking it when the target is not displayable.
+stock bool:WmDisplayMenu(id, menu)
+{
+    if (!WmValidClient(id))
+    {
+        menu_destroy(menu);
+        return false;
+    }
+    menu_display(id, menu, 0);
+    return true;
+}
+
+public native_open(plugin, params)
+{
+    new id = get_param(1);
+    if(WmValidClient(id))
+        CmdOpenSkins(id);
+}
+
+public native_has_custom_model(plugin, params)
+{
+    new id = get_param(1);
+    if(!WmValidClient(id))
+        return 0;
+    return fn_is_custom_model_active(id);
+}
+
+public fn_is_custom_model_active(id)
+{
+    if(!WmValidClient(id))
+        return 0;
+
+    if(g_szForcedPlayerModel[id][0] || g_szCustomPlayerModel[id][0] || g_szEquippedPlayerModel[id][0])
+        return 1;
+
+    return 0;
+}
+
+public _native_models_get_equipped(plugin, params)
+{
+    new id = get_param(1)
+    if (!WmValidClient(id))
+        return;
+    new CsTeams:iTeam = cs_get_user_team(id)
+    if (iTeam == CS_TEAM_CT && g_szEquipCT[id][0])
+        set_string(2, g_szEquipCT[id], get_param(3));
+    else if (iTeam == CS_TEAM_T && g_szEquipT[id][0])
+        set_string(2, g_szEquipT[id], get_param(3));
+    else if (g_szEquipT[id][0])
+        set_string(2, g_szEquipT[id], get_param(3));
+    else
+        set_string(2, g_szEquipCT[id], get_param(3));
+}
+
+public _native_models_set_equipped(plugin, params)
+{
+    new id = get_param(1);
+    if (!WmValidClient(id))
+        return;
+    new szModel[32];
+    get_string(2, szModel, charsmax(szModel));
+    new team = get_param(3);
+
+    // Empty model = reset that team slot (or both if team=0).
+    if (!szModel[0])
+    {
+        if (team == 1) g_szEquipT[id][0] = 0;
+        else if (team == 2) g_szEquipCT[id][0] = 0;
+        else { g_szEquipT[id][0] = 0; g_szEquipCT[id][0] = 0; }
+        SavePlayerSkinsVault(id);
+        if (is_user_alive(id))
+            ApplySpawnPlayerModel(id);
+        return;
+    }
+
+    new iIdx = FindPremadeModelIndex(szModel);
+    if (iIdx <= 0)
+        return;
+    if (!(g_iPlayerModelOwned[id] & (1 << iIdx)) && !(get_user_flags(id) & (ADMIN_IMMUNITY | ADMIN_RCON)))
+        return;
+    if (!EnsureSkinsLoaded(id))
+        return;
+    if (PModelVipBlocked(id, szModel))
+        return;
+
+    new iSlot = (team != 0) ? team : g_PremadePlayerModels[iIdx][PMODEL_TEAM];
+    if (iSlot == 2) copy(g_szEquipCT[id], charsmax(g_szEquipCT[]), szModel);
+    else if (iSlot == 1) copy(g_szEquipT[id], charsmax(g_szEquipT[]), szModel);
+    else
+    {
+        copy(g_szEquipT[id], charsmax(g_szEquipT[]), szModel);
+        copy(g_szEquipCT[id], charsmax(g_szEquipCT[]), szModel);
+    }
+    SavePlayerSkinsVault(id);
+
+    if (is_user_alive(id))
+        ApplySpawnPlayerModel(id);
+}
+
+FindPremadeModelIndex(const szModel[])
+{
+    for (new i = 1; i < sizeof(g_PremadePlayerModels); i++)
+    {
+        if (equal(szModel, g_PremadePlayerModels[i][PMODEL_FILE]))
+            return i;
+    }
+    return 0;
+}
+
+public _native_skins_get_price(plugin, params)
+{
+    new group = get_param(1);
+    new skin = get_param(2);
+    if (group < 0 || group >= GROUP_COUNT || skin < 0 || skin >= g_SkinCount[group])
+        return 0;
+    return g_CoinPrice[group][skin];
+}
+
+// Gate check without ownership/price. Used by the buy confirmation path:
+// CanUseSkin() is ownership-aware, so it must not be used to validate an
+// unowned coin purchase after the player has already met the VIP/tier gates.
+bool:CanMeetSkinGates(id, group, skin)
+{
+    if (!WmValidClient(id) || group < 0 || group >= GROUP_COUNT || skin < 0 || skin >= g_SkinCount[group])
+        return false;
+    if (skin == 0)
+        return true;
+    new reqVip = g_VipOnly[group][skin];
+    if (reqVip >= 3)
+    {
+        // Mastery tier 3 (vipelite/admin/owner): strictest real gate.
+        if (GetPlayerVipTier(id) < FNVIP_ELITE) return false;
+    }
+    else if (reqVip == 2)
+    {
+        if (GetBpLevel(id) < 52) return false;
+    }
+    else if (reqVip == 1)
+    {
+        if (GetPlayerVipTier(id) < FNVIP_VIP) return false;
+    }
+    new reqLvl = g_BPLevel[group][skin];
+    if (reqLvl > 0 && GetBpLevel(id) < reqLvl)
+        return false;
+    return true;
+}
+
+// Gate check for web-panel purchases: VIP/level requirements WITHOUT the
+// ownership test (buy path unlocks). Mirrors CanUseSkin minus owned/price.
+public _native_skins_can_buy(plugin, params)
+{
+    new id = get_param(1);
+    new group = get_param(2);
+    new skin = get_param(3);
+    return CanMeetSkinGates(id, group, skin) ? 1 : 0;
+}
+
+// Gate check for web-panel model purchases: VIP requirement only
+// (BP-level models are price 0 and already rejected as not for sale).
+// Mirrors PModelVipBlocked.
+public _native_models_can_buy(plugin, params)
+{
+    new id = get_param(1);
+    if (!WmValidClient(id))
+        return 0;
+    new szModel[32];
+    get_string(2, szModel, charsmax(szModel));
+    if (!szModel[0])
+        return 0;
+    return PModelVipBlocked(id, szModel) ? 0 : 1;
+}
+
+public _native_models_get_price(plugin, params)
+{
+    new szModel[32];
+    get_string(1, szModel, charsmax(szModel));
+    new iIdx = FindPremadeModelIndex(szModel);
+    if (iIdx <= 0)
+        return 0;
+    return g_PremadePlayerModels[iIdx][PMODEL_PRICE];
+}
+
+public bool:_native_models_is_owned(plugin, params)
+{
+    new id = get_param(1);
+    new szModel[32];
+    get_string(2, szModel, charsmax(szModel));
+    if (!WmValidClient(id))
+        return false;
+    if (!szModel[0])
+        return true;
+    new iIdx = FindPremadeModelIndex(szModel);
+    if (iIdx <= 0)
+        return false;
+    return bool:(g_iPlayerModelOwned[id] & (1 << iIdx)) || bool:(get_user_flags(id) & (ADMIN_IMMUNITY | ADMIN_RCON));
+}
+
+public _native_models_unlock(plugin, params)
+{
+    new id = get_param(1);
+    new szModel[32];
+    get_string(2, szModel, charsmax(szModel));
+    if (!WmValidClient(id))
+        return 0;
+    new iIdx = FindPremadeModelIndex(szModel);
+    if (iIdx <= 0)
+        return 0;
+    if (!EnsureSkinsLoaded(id))
+        return 0;
+    g_iPlayerModelOwned[id] |= (1 << iIdx);
+    SavePlayerSkinsVault(id);
+    return 1;
+}
+
+public _native_models_is_forced(plugin, params)
+{
+    new id = get_param(1);
+    if (!WmValidClient(id)) return 0;
+    return (g_szForcedPlayerModel[id][0] || g_szCustomPlayerModel[id][0]) ? 1 : 0;
+}
+
+public _native_skins_get_equipped(plugin, params)
+{
+    new id = get_param(1);
+    new group = get_param(2);
+    if (!WmValidClient(id) || group < 0 || group >= GROUP_COUNT) return 0;
+    return g_SelectedSkin[id][group];
+}
+
+public _native_skins_set_equipped(plugin, params)
+{
+    new id = get_param(1);
+    new group = get_param(2);
+    new skin = get_param(3);
+    if (!WmValidClient(id) || group < 0 || group >= GROUP_COUNT || skin < 0 || skin >= g_SkinCount[group]) return 0;
+    if (!EnsureSkinsLoaded(id)) return 0;
+    if (!IsSkinOwned(id, group, skin) || !CanUseSkin(id, group, skin)) return 0;
+
+    g_SelectedSkin[id][group] = skin;
+    SavePlayerSkinsVault(id);
+    if (is_user_alive(id))
+        ApplyCurrentWeaponSkin(id);
+    return 1;
+}
+
+public bool:_native_skins_is_owned(plugin, params)
+{
+    new id = get_param(1);
+    new group = get_param(2);
+    new skin = get_param(3);
+    if (!WmValidClient(id))
+        return false;
+    return IsSkinOwned(id, group, skin);
+}
+
+public _native_skins_unlock(plugin, params)
+{
+    new id = get_param(1);
+    new group = get_param(2);
+    new skin = get_param(3);
+    if (!WmValidClient(id) || group < 0 || group >= GROUP_COUNT || skin < 0 || skin >= g_SkinCount[group]) return 0;
+    if (!EnsureSkinsLoaded(id)) return 0;
+
+    SetSkinOwned(id, group, skin, true);
+    SavePlayerSkinsVault(id);
+    return 1;
+}
+
+public _native_skins_unlock_model(plugin, params)
+{
+    new id = get_param(1);
+    new group = get_param(2);
+    new szView[MODEL_PATH_LEN];
+    get_string(3, szView, charsmax(szView));
+    if (!WmValidClient(id) || group < 0 || group >= GROUP_COUNT || !szView[0])
+        return 0;
+    if (!EnsureSkinsLoaded(id))
+        return 0;
+    for (new i = 1; i < g_SkinCount[group]; i++)
+    {
+        if (equal(g_ViewModels[group][i], szView))
+        {
+            SetSkinOwned(id, group, i, true);
+            SavePlayerSkinsVault(id);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+public _native_skins_get_count(plugin, params)
+{
+    new group = get_param(1);
+    if (group < 0 || group >= GROUP_COUNT) return 0;
+    return g_SkinCount[group];
+}
+
+public _native_skins_get_name(plugin, params)
+{
+    new group = get_param(1);
+    new skin = get_param(2);
+    if (group < 0 || group >= GROUP_COUNT || skin < 0 || skin >= g_SkinCount[group]) return;
+    set_string(3, g_SkinNames[group][skin], get_param(4));
+}
+
+public plugin_end()
+{
+    if (g_Vault != INVALID_HANDLE)
+    {
+        nvault_close(g_Vault);
+    }
+}
+
+public client_putinserver(id)
+{
+    ResetPlayerSelections(id);
+
+    if (!is_user_bot(id) && !is_user_hltv(id))
+    {
+        remove_task(id + TASK_LOAD_PLAYER);
+        g_iLoadPlayerRetries[id] = 0;
+        set_task(2.0, "TaskLoadPlayerData", id + TASK_LOAD_PLAYER);
+    }
+}
+
+public client_disconnected(id)
+{
+    remove_task(id + TASK_LOAD_PLAYER);
+    remove_task(id + TASK_SPAWN_MODEL);
+    if (g_bSkinsLoaded[id])
+        SavePlayerSkinsVault(id);
+    ResetPlayerSelections(id);
+}
+
+public TaskLoadPlayerData(taskid)
+{
+    new id = taskid - TASK_LOAD_PLAYER;
+    if (!is_user_connected(id) || is_user_bot(id) || is_user_hltv(id))
+        return;
+
+    new szAuth[PLAYER_ID_LEN];
+    GetPlayerIdentifier(id, szAuth, charsmax(szAuth));
+    if (!szAuth[0])
+    {
+        // Cap retries: a permanently-pending SteamID must not re-task forever
+        // (cf. clutch 3-try pattern).
+        if (++g_iLoadPlayerRetries[id] > 10)
+        {
+            log_amx("[FreeNova Skins] Giving up skin load for slot %d (no SteamID after %d tries).", id, g_iLoadPlayerRetries[id]);
+            return;
+        }
+        set_task(3.0, "TaskLoadPlayerData", id + TASK_LOAD_PLAYER);
+        return;
+    }
+
+    LoadPlayerSkinsVault(id);
+}
+
+// ============================================================
+// CONFIG LOADING & PRECACHING
+// ============================================================
+
+BuildConfigPath()
+{
+    get_configsdir(g_ConfigPath, charsmax(g_ConfigPath));
+    add(g_ConfigPath, charsmax(g_ConfigPath), "/");
+    add(g_ConfigPath, charsmax(g_ConfigPath), CONFIG_FILE);
+}
+
+BuildCustomSkinsPath()
+{
+    get_configsdir(g_szCustomSkinsPath, charsmax(g_szCustomSkinsPath));
+    add(g_szCustomSkinsPath, charsmax(g_szCustomSkinsPath), "/");
+    add(g_szCustomSkinsPath, charsmax(g_szCustomSkinsPath), CUSTOM_SKINS_FILE);
+}
+
+LoadSkinsConfig()
+{
+    ResetSkinData();
+    AddDefaultSkins();
+
+    if (!file_exists(g_ConfigPath))
+    {
+        log_amx("[FreeNova Skins] Config not found: %s", g_ConfigPath);
+        return;
+    }
+
+    new fp = fopen(g_ConfigPath, "rt");
+    if (!fp)
+    {
+        log_amx("[FreeNova Skins] Failed to open config: %s", g_ConfigPath);
+        return;
+    }
+
+    new line[CONFIG_LINE_LEN];
+    new weapon[16], skinName[SKIN_NAME_LEN], viewModel[MODEL_PATH_LEN];
+    new playerModel[MODEL_PATH_LEN], vipStr[8], bpLevelStr[8], coinStr[16];
+    new parsed, group, vipOnly, bpLevel, coinPrice;
+
+    while (!feof(fp))
+    {
+        fgets(fp, line, charsmax(line));
+        trim(line);
+
+        if (!line[0] || line[0] == ';' || line[0] == '#')
+            continue;
+        if (line[0] == '/' && line[1] == '/')
+            continue;
+
+        weapon[0] = 0; skinName[0] = 0; viewModel[0] = 0;
+        playerModel[0] = 0; vipStr[0] = 0; bpLevelStr[0] = 0; coinStr[0] = 0;
+
+        parsed = parse(line,
+            weapon, charsmax(weapon),
+            skinName, charsmax(skinName),
+            viewModel, charsmax(viewModel),
+            playerModel, charsmax(playerModel),
+            vipStr, charsmax(vipStr),
+            bpLevelStr, charsmax(bpLevelStr),
+            coinStr, charsmax(coinStr));
+
+        if (parsed < 4)
+        {
+            log_amx("[FreeNova Skins] Bad config line: %s", line);
+            continue;
+        }
+
+        group = WeaponToGroup(weapon);
+        if (group == -1)
+        {
+            log_amx("[FreeNova Skins] Unknown weapon type: %s", weapon);
+            continue;
+        }
+
+        if (!file_exists(viewModel))
+        {
+            log_amx("[FreeNova Skins] Missing view model: %s", viewModel);
+            continue;
+        }
+
+        if (equal(playerModel, "-"))
+            copy(playerModel, MODEL_PATH_LEN - 1, g_DefaultPlayerModel[group]);
+        else if (!file_exists(playerModel))
+        {
+            log_amx("[FreeNova Skins] Missing player model: %s", playerModel);
+            continue;
+        }
+
+        vipOnly = 0;
+        if (parsed >= 5 && vipStr[0])
+            vipOnly = str_to_num(vipStr);
+
+        bpLevel = 0;
+        if (parsed >= 6 && bpLevelStr[0])
+            bpLevel = str_to_num(bpLevelStr);
+
+        coinPrice = 0;
+        if (parsed >= 7 && coinStr[0])
+            coinPrice = str_to_num(coinStr);
+
+        if (!AddSkin(group, skinName, viewModel, playerModel, vipOnly, bpLevel, coinPrice))
+            log_amx("[FreeNova Skins] Too many skins for: %s", weapon);
+    }
+
+    fclose(fp);
+
+    for (new i = 0; i < GROUP_COUNT; i++)
+        log_amx("[FreeNova Skins] Loaded %d skins for %s", g_SkinCount[i], g_GroupNames[i]);
+}
+
+LoadMasterySkinsConfig()
+{
+    new szPath[128];
+    get_configsdir(szPath, charsmax(szPath));
+    format(szPath, charsmax(szPath), "%s/%s", szPath, MASTERY_SKINS_FILE);
+    if (!file_exists(szPath))
+    {
+        log_amx("[FreeNova Skins] mastery_skins.ini not found - lockers stay hover-only until the owner adds rows.");
+        return;
+    }
+
+    new fp = fopen(szPath, "rt");
+    if (!fp) return;
+
+    new line[CONFIG_LINE_LEN];
+    new weapon[16], masteryStr[8], flag[16], skinName[SKIN_NAME_LEN];
+    new viewModel[MODEL_PATH_LEN], playerModel[MODEL_PATH_LEN];
+    new loaded;
+    while (!feof(fp))
+    {
+        fgets(fp, line, charsmax(line));
+        trim(line);
+        if (!line[0] || line[0] == ';' || line[0] == '#')
+            continue;
+        if (line[0] == '/' && line[1] == '/')
+            continue;
+
+        weapon[0] = 0; masteryStr[0] = 0; flag[0] = 0; skinName[0] = 0;
+        viewModel[0] = 0; playerModel[0] = 0;
+        new parsed = parse(line,
+            weapon, charsmax(weapon),
+            masteryStr, charsmax(masteryStr),
+            flag, charsmax(flag),
+            skinName, charsmax(skinName),
+            viewModel, charsmax(viewModel),
+            playerModel, charsmax(playerModel));
+        if (parsed < 5)
+            continue;
+
+        new group = WeaponToGroup(weapon);
+        if (group == -1) continue;
+        if (!file_exists(viewModel))
+        {
+            log_amx("[FreeNova Skins] mastery_skins.ini missing model %s", viewModel);
+            continue;
+        }
+        if (!playerModel[0] || equal(playerModel, "-"))
+            copy(playerModel, MODEL_PATH_LEN - 1, g_DefaultPlayerModel[group]);
+
+        new iVip = 0;
+        if (equali(flag, "vip")) iVip = 1;
+        else if (equali(flag, "vipplus") || equali(flag, "vip+")) iVip = 2;
+        else if (equali(flag, "vipelite") || equali(flag, "admin") || equali(flag, "owner")) iVip = 3;
+
+        if (AddSkin(group, skinName, viewModel, playerModel, iVip, str_to_num(masteryStr), 0))
+            loaded++;
+    }
+    fclose(fp);
+    log_amx("[FreeNova Skins] mastery_skins.ini loaded %d extra locker skins", loaded);
+}
+
+ResetSkinData()
+{
+    for (new group = 0; group < GROUP_COUNT; group++)
+    {
+        g_SkinCount[group] = 0;
+        for (new i = 0; i < MAX_SKINS_PER_GROUP; i++)
+        {
+            g_SkinNames[group][i][0] = 0;
+            g_ViewModels[group][i][0] = 0;
+            g_PlayerModels[group][i][0] = 0;
+            g_VipOnly[group][i] = 0;
+            g_BPLevel[group][i] = 0;
+            g_CoinPrice[group][i] = 0;
+        }
+    }
+}
+
+AddDefaultSkins()
+{
+    for (new group = 0; group < GROUP_COUNT; group++)
+        AddSkin(group, "Default", g_DefaultViewModel[group], g_DefaultPlayerModel[group], 0, 0, 0);
+}
+
+bool:AddSkin(group, const skinName[], const viewModel[], const playerModel[], vipOnly, bpLevel, coinPrice)
+{
+    if (group < 0 || group >= GROUP_COUNT) return false;
+
+    new slot = g_SkinCount[group];
+    if (slot >= MAX_SKINS_PER_GROUP) return false;
+
+    copy(g_SkinNames[group][slot], SKIN_NAME_LEN - 1, skinName);
+    copy(g_ViewModels[group][slot], MODEL_PATH_LEN - 1, viewModel);
+    copy(g_PlayerModels[group][slot], MODEL_PATH_LEN - 1, playerModel);
+    g_VipOnly[group][slot] = vipOnly;
+    g_BPLevel[group][slot] = bpLevel;
+    g_CoinPrice[group][slot] = coinPrice;
+
+    g_SkinCount[group]++;
+    return true;
+}
+
+PrecacheLoadedModels()
+{
+    for (new group = 0; group < GROUP_COUNT; group++)
+    {
+        for (new i = 0; i < g_SkinCount[group]; i++)
+        {
+            if (g_ViewModels[group][i][0] && file_exists(g_ViewModels[group][i]))
+                precache_model(g_ViewModels[group][i]);
+            if (g_PlayerModels[group][i][0] && file_exists(g_PlayerModels[group][i]))
+                precache_model(g_PlayerModels[group][i]);
+        }
+    }
+}
+
+LoadAndPrecacheCustomSkins()
+{
+    // Precache premade player models if present
+    if (file_exists("models/player/vip_ct/vip_ct.mdl"))
+        precache_model("models/player/vip_ct/vip_ct.mdl");
+    if (file_exists("models/player/vip_tero/vip_tero.mdl"))
+        precache_model("models/player/vip_tero/vip_tero.mdl");
+    if (file_exists("models/player/s1_vip_ct/s1_vip_ct.mdl"))
+        precache_model("models/player/s1_vip_ct/s1_vip_ct.mdl");
+    if (file_exists("models/player/s1_vip_t/s1_vip_t.mdl"))
+        precache_model("models/player/s1_vip_t/s1_vip_t.mdl");
+    if (file_exists("models/player/s1_op_ct/s1_op_ct.mdl"))
+        precache_model("models/player/s1_op_ct/s1_op_ct.mdl");
+    if (file_exists("models/player/s1_op_t/s1_op_t.mdl"))
+        precache_model("models/player/s1_op_t/s1_op_t.mdl");
+    if (file_exists("models/player/admin_ct/admin_ct.mdl"))
+        precache_model("models/player/admin_ct/admin_ct.mdl");
+    if (file_exists("models/player/admin_te/admin_te.mdl"))
+        precache_model("models/player/admin_te/admin_te.mdl");
+    if (file_exists("models/player/admin_tero/admin_tero.mdl"))
+        precache_model("models/player/admin_tero/admin_tero.mdl");
+    if (file_exists("models/player/legend_ct/legend_ct.mdl"))
+        precache_model("models/player/legend_ct/legend_ct.mdl");
+    if (file_exists("models/player/legend_t/legend_t.mdl"))
+        precache_model("models/player/legend_t/legend_t.mdl");
+    if (file_exists("models/player/legend_te/legend_te.mdl"))
+        precache_model("models/player/legend_te/legend_te.mdl");
+
+    if (!file_exists(g_szCustomSkinsPath))
+    {
+        CreateDefaultCustomSkinsConfig();
+        return;
+    }
+
+    new fp = fopen(g_szCustomSkinsPath, "rt");
+    if (!fp) return;
+
+    new line[CONFIG_LINE_LEN];
+    new szAuth[PLAYER_ID_LEN], szType[16], szSub[32], szMdl1[MODEL_PATH_LEN], szMdl2[MODEL_PATH_LEN];
+
+    while (!feof(fp))
+    {
+        fgets(fp, line, charsmax(line));
+        trim(line);
+
+        if (!line[0] || line[0] == ';' || line[0] == '#' || (line[0] == '/' && line[1] == '/'))
+            continue;
+
+        szAuth[0] = 0; szType[0] = 0; szSub[0] = 0; szMdl1[0] = 0; szMdl2[0] = 0;
+        new parsed = parse(line,
+            szAuth, charsmax(szAuth),
+            szType, charsmax(szType),
+            szSub, charsmax(szSub),
+            szMdl1, charsmax(szMdl1),
+            szMdl2, charsmax(szMdl2));
+
+        if (parsed < 4) continue;
+
+        if (equali(szType, "weapon"))
+        {
+            if (file_exists(szMdl1))
+                precache_model(szMdl1);
+            if (parsed >= 5 && szMdl2[0] && !equal(szMdl2, "-") && file_exists(szMdl2))
+                precache_model(szMdl2);
+        }
+        else if (equali(szType, "player"))
+        {
+            new szPath[128];
+            formatex(szPath, charsmax(szPath), "models/player/%s/%s.mdl", szMdl1, szMdl1);
+            if (file_exists(szPath))
+                precache_model(szPath);
+        }
+    }
+    fclose(fp);
+}
+
+LoadAndPrecacheForcedModels()
+{
+    new szPath[128];
+    get_configsdir(szPath, charsmax(szPath));
+    add(szPath, charsmax(szPath), "/freenova/player_models.ini");
+
+    if (!file_exists(szPath)) return;
+
+    new fp = fopen(szPath, "rt");
+    if (!fp) return;
+
+    new line[CONFIG_LINE_LEN], sTarget[64], sModel[32], sTeam[8];
+    while (!feof(fp))
+    {
+        fgets(fp, line, charsmax(line));
+        trim(line);
+        if (!line[0] || line[0] == ';' || line[0] == '#') continue;
+
+        sTarget[0] = 0; sModel[0] = 0; sTeam[0] = 0;
+        new parsed = parse(line, sTarget, charsmax(sTarget), sModel, charsmax(sModel), sTeam, charsmax(sTeam));
+        if (parsed < 2) continue;
+
+        new szModelPath[128];
+        formatex(szModelPath, charsmax(szModelPath), "models/player/%s/%s.mdl", sModel, sModel);
+        if (file_exists(szModelPath))
+            precache_model(szModelPath);
+    }
+    fclose(fp);
+}
+
+CreateDefaultCustomSkinsConfig()
+{
+    new fp = fopen(g_szCustomSkinsPath, "wt");
+    if (!fp) return;
+
+    fputs(fp, "; ===================================================================^n");
+    fputs(fp, "; FreeNova Custom Skins & Models - Exclusive Player Assignments^n");
+    fputs(fp, "; ===================================================================^n");
+    fputs(fp, "; Format for Weapon Skins:^n");
+    fputs(fp, ";   <authid> weapon <group> <v_model> [p_model]^n");
+    fputs(fp, ";   Where <group> is: ak47 | m4a1 | deagle | awp | knife^n");
+    fputs(fp, ";   Example:^n");
+    fputs(fp, ";   STEAM_0:0:12345678 weapon ak47 models/v_custom_ak.mdl models/p_custom_ak.mdl^n");
+    fputs(fp, ";^n");
+    fputs(fp, "; Format for Player Models:^n");
+    fputs(fp, ";   <authid> player <team> <model_name>^n");
+    fputs(fp, ";   Where <team> is: all | t | ct^n");
+    fputs(fp, ";   <model_name> must exist in models/player/<model_name>/<model_name>.mdl^n");
+    fputs(fp, ";   Example:^n");
+    fputs(fp, ";   STEAM_0:0:12345678 player ct vip_ct^n");
+    fputs(fp, ";   STEAM_0:0:12345678 player t vip_tero^n");
+    fputs(fp, "; ===================================================================^n");
+    fclose(fp);
+}
+
+// ============================================================
+// PLAYER DATA & NVAULT STORAGE
+// ============================================================
+
+ResetPlayerSelections(id)
+{
+    for (new g = 0; g < GROUP_COUNT; g++)
+    {
+        g_SelectedSkin[id][g] = 0;
+        g_iOwnedMask[id][g][0] = 1; // Default is always owned
+        g_iOwnedMask[id][g][1] = 0;
+        g_szCustomWeaponV[id][g][0] = 0;
+        g_szCustomWeaponP[id][g][0] = 0;
+    }
+    g_szEquippedPlayerModel[id][0] = 0;
+    g_iEquippedPlayerTeam[id] = 0;
+    g_szEquipT[id][0] = 0;
+    g_szEquipCT[id][0] = 0;
+    g_iPlayerModelOwned[id] = 1;
+    g_szCustomPlayerModel[id][0] = 0;
+    g_iCustomPlayerTeam[id] = 0;
+    g_bHasCustomSkinOrder[id] = false;
+    g_bSkinsLoaded[id] = false;
+    g_iPendingBuyGroup[id] = -1;
+    g_iPendingBuySkin[id] = -1;
+}
+
+bool:AuthIdPending(const szAuth[])
+{
+    return bool:(!szAuth[0]
+        || equali(szAuth, "STEAM_ID_PENDING")
+        || equali(szAuth, "STEAM_ID_LAN")
+        || equali(szAuth, "VALVE_ID_LAN")
+        || equali(szAuth, "VALVE_ID_PENDING")
+        || equali(szAuth, "BOT")
+        || equali(szAuth, "HLTV")
+        || equali(szAuth, "UNKNOWN")
+        || equali(szAuth, "4294967295")
+        || equali(szAuth, "PENDING"));
+}
+
+bool:EnsureSkinsLoaded(id)
+{
+    if (g_bSkinsLoaded[id])
+        return true;
+    if (!WmValidClient(id) || is_user_bot(id) || is_user_hltv(id))
+        return false;
+    new szAuth[PLAYER_ID_LEN];
+    GetPlayerIdentifier(id, szAuth, charsmax(szAuth));
+    if (!szAuth[0])
+        return false;
+    LoadPlayerSkinsVault(id);
+    return g_bSkinsLoaded[id];
+}
+
+// Fail-closed debit. Last-coin success returns 0 from menabp_add_coins, so
+// also require the wallet to drop. Never unlock if BP data is still loading.
+stock bool:WmDebitCoins(id, iCost)
+{
+    if (iCost <= 0 || !LibraryExists("menabp", LibType_Library))
+        return false;
+    new iBefore = menabp_get_coins(id);
+    if (iBefore < iCost)
+        return false;
+    new iAfter = menabp_add_coins(id, -iCost);
+    if (iAfter == 0 && menabp_get_coins(id) >= iBefore)
+        return false;
+    if (menabp_get_coins(id) > iBefore - iCost)
+        return false;
+    return true;
+}
+
+bool:PModelVipBlocked(id, const szModel[])
+{
+    new iIdx = FindPremadeModelIndex(szModel);
+    if (iIdx <= 0)
+        return false;
+    new iNeed = g_PremadePlayerModels[iIdx][PMODEL_VIP];
+    if (iNeed <= 0)
+        return false;
+    if (get_user_flags(id) & (ADMIN_IMMUNITY | ADMIN_RCON))
+        return false;
+    return bool:(fnvip_get_tier(id) < iNeed);
+}
+
+bool:ModelPrecached(const szPath[])
+{
+    if (!szPath[0])
+        return false;
+    return bool:(engfunc(EngFunc_ModelIndex, szPath) > 0);
+}
+
+GetPlayerIdentifier(id, output[], len)
+{
+    output[0] = 0;
+    get_user_authid(id, output, len);
+    if (AuthIdPending(output))
+        output[0] = 0;
+}
+
+SavePlayerSkinsVault(id)
+{
+    if (g_Vault == INVALID_HANDLE || !g_bSkinsLoaded[id])
+        return;
+
+    new playerId[PLAYER_ID_LEN], key[VAULT_KEY_LEN], value[VAULT_DATA_LEN];
+    GetPlayerIdentifier(id, playerId, charsmax(playerId));
+    if (!playerId[0]) return;
+
+    // Weapon skin selections
+    formatex(key, charsmax(key), "skins#%s", playerId);
+    formatex(value, charsmax(value),
+        "^"%s^" ^"%s^" ^"%s^" ^"%s^" ^"%s^"",
+        g_SkinNames[GROUP_AK47][g_SelectedSkin[id][GROUP_AK47]],
+        g_SkinNames[GROUP_M4A1][g_SelectedSkin[id][GROUP_M4A1]],
+        g_SkinNames[GROUP_DEAGLE][g_SelectedSkin[id][GROUP_DEAGLE]],
+        g_SkinNames[GROUP_AWP][g_SelectedSkin[id][GROUP_AWP]],
+        g_SkinNames[GROUP_KNIFE][g_SelectedSkin[id][GROUP_KNIFE]]);
+    nvault_set(g_Vault, key, value);
+
+    // Ownership bitmasks
+    for (new g = 0; g < GROUP_COUNT; g++)
+    {
+        formatex(key, charsmax(key), "own#%s#%d", playerId, g);
+        formatex(value, charsmax(value), "%d %d", g_iOwnedMask[id][g][0], g_iOwnedMask[id][g][1]);
+        nvault_set(g_Vault, key, value);
+    }
+
+    // Premade player models: independent T and CT slots
+    formatex(key, charsmax(key), "pmodel#%s", playerId);
+    formatex(value, charsmax(value), "^"%s^" ^"%s^" %d",
+        g_szEquipT[id], g_szEquipCT[id], g_iPlayerModelOwned[id]);
+    nvault_set(g_Vault, key, value);
+
+    // Custom order flag
+    formatex(key, charsmax(key), "order#%s", playerId);
+    formatex(value, charsmax(value), "%d", g_bHasCustomSkinOrder[id] ? 1 : 0);
+    nvault_set(g_Vault, key, value);
+}
+
+// One-shot 100 -> 37 unique-skins migration (2026-10-11 skins dedup).
+// Pre-dedup owned index -> post-dedup index, per group ([0] unused).
+// Every old visual has exactly one successor (verified by generator).
+// Knife group is byte-identical and needs no remap.
+new const g_SkinMig_AK47[21] = { 0, 1, 2, 3, 4, 1, 3, 3, 1, 3, 3, 3, 3, 1, 1, 3, 1, 1, 3, 4, 1 };
+new const g_SkinMig_M4A1[21] = { 0, 1, 3, 4, 7, 6, 5, 2, 3, 7, 6, 4, 5, 7, 4, 7, 6, 5, 5, 6, 7 };
+new const g_SkinMig_Deagle[21] = { 0, 1, 2, 3, 1, 2, 1, 2, 2, 1, 2, 1, 1, 2, 1, 2, 3, 1, 2, 1, 2 };
+new const g_SkinMig_AWP[21] = { 0, 1, 2, 3, 1, 2, 1, 2, 2, 1, 2, 1, 1, 2, 1, 2, 3, 1, 2, 1, 2 };
+// Coin refund when the old purchase has no coin-buyable successor
+// (successor is a VIP/level gate). Paid rows mapping to a buyable row
+// transfer ownership with no refund.
+new const g_SkinMigRefund_AK47[21] = { 0, 25000, 0, 20000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8000, 12000, 5000, 0, 0 };
+new const g_SkinMigRefund_M4A1[21] = { 0, 0, 30000, 28000, 32000, 32000, 20000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5000, 15000, 8000, 0 };
+new const g_SkinMigRefund_Deagle[21] = { 0, 18000, 15000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7000, 4000, 0, 5000, 0, 0, 0 };
+new const g_SkinMigRefund_AWP[21] = { 0, 50000, 25000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 18000, 8000, 0, 12000, 0, 0, 0 };
+
+MigrateSkinsOwnership(id, const playerId[])
+{
+    if (g_Vault == INVALID_HANDLE)
+        return;
+    new key[VAULT_KEY_LEN], value[VAULT_DATA_LEN];
+    formatex(key, charsmax(key), "skinmig#%s", playerId);
+    if (nvault_get(g_Vault, key, value, charsmax(value)))
+        return; // already migrated
+
+    new totalRefund = 0;
+    for (new g = 0; g < GROUP_COUNT; g++)
+    {
+        if (g == GROUP_KNIFE)
+            continue;
+        new oldMask = g_iOwnedMask[id][g][0];
+        new newMask = 1; // bit 0 = Default stays owned
+        for (new b = 1; b <= 20; b++)
+        {
+            if (!(oldMask & (1 << b)))
+                continue;
+            new iSlot = -1, iRefund = 0;
+            if (g == GROUP_AK47) { iSlot = g_SkinMig_AK47[b]; iRefund = g_SkinMigRefund_AK47[b]; }
+            else if (g == GROUP_M4A1) { iSlot = g_SkinMig_M4A1[b]; iRefund = g_SkinMigRefund_M4A1[b]; }
+            else if (g == GROUP_DEAGLE) { iSlot = g_SkinMig_Deagle[b]; iRefund = g_SkinMigRefund_Deagle[b]; }
+            else if (g == GROUP_AWP) { iSlot = g_SkinMig_AWP[b]; iRefund = g_SkinMigRefund_AWP[b]; }
+            if (iSlot > 0)
+            {
+                newMask |= (1 << iSlot);
+                if (iRefund > 0)
+                {
+                    totalRefund += iRefund;
+                    log_amx("[FreeNova Skins] Migration refund %d coins to %s (old %d -> new %d)", iRefund, playerId, b, iSlot);
+                }
+            }
+            else
+                log_amx("[FreeNova Skins] Migration retired owned skin without successor: %s group %d old %d", playerId, g, b);
+        }
+        g_iOwnedMask[id][g][0] = newMask;
+        // Persist remapped masks now (SavePlayerSkinsVault is load-guarded).
+        formatex(key, charsmax(key), "own#%s#%d", playerId, g);
+        formatex(value, charsmax(value), "%d %d", g_iOwnedMask[id][g][0], g_iOwnedMask[id][g][1]);
+        nvault_set(g_Vault, key, value);
+    }
+
+    if (totalRefund > 0)
+    {
+        if (LibraryExists("menabp", LibType_Library))
+        {
+            menabp_add_coins(id, totalRefund);
+            client_printcolor(id, "!g[FreeNova Skins] !nShop updated: duplicate skins merged. Refunded !g%d Coins!n for retired purchases.", totalRefund);
+        }
+        else
+            log_amx("[FreeNova Skins] Migration could not refund %d coins to %s (menabp offline)", totalRefund, playerId);
+    }
+    formatex(key, charsmax(key), "skinmig#%s", playerId);
+    nvault_set(g_Vault, key, "1");
+    log_amx("[FreeNova Skins] Migrated 100->37 ownership for %s (refund=%d)", playerId, totalRefund);
+}
+
+LoadPlayerSkinsVault(id)
+{
+    if (g_Vault == INVALID_HANDLE || !is_user_connected(id))
+        return;
+
+    new playerId[PLAYER_ID_LEN], key[VAULT_KEY_LEN], value[VAULT_DATA_LEN];
+    GetPlayerIdentifier(id, playerId, charsmax(playerId));
+    if (!playerId[0]) return;
+
+    // Load ownership bitmasks first
+    for (new g = 0; g < GROUP_COUNT; g++)
+    {
+        g_iOwnedMask[id][g][0] = 1;
+        g_iOwnedMask[id][g][1] = 0;
+
+        formatex(key, charsmax(key), "own#%s#%d", playerId, g);
+        if (nvault_get(g_Vault, key, value, charsmax(value)))
+        {
+            new s0[16], s1[16];
+            parse(value, s0, charsmax(s0), s1, charsmax(s1));
+            g_iOwnedMask[id][g][0] = str_to_num(s0) | 1;
+            g_iOwnedMask[id][g][1] = str_to_num(s1);
+        }
+    }
+
+    // One-shot 100 -> 37 ownership migration (no-op after first run).
+    MigrateSkinsOwnership(id, playerId);
+
+    // Load weapon selections
+    formatex(key, charsmax(key), "skins#%s", playerId);
+    if (nvault_get(g_Vault, key, value, charsmax(value)))
+    {
+        new ak[SKIN_NAME_LEN], m4[SKIN_NAME_LEN], deagle[SKIN_NAME_LEN];
+        new awp[SKIN_NAME_LEN], knife[SKIN_NAME_LEN];
+
+        parse(value,
+            ak, charsmax(ak),
+            m4, charsmax(m4),
+            deagle, charsmax(deagle),
+            awp, charsmax(awp),
+            knife, charsmax(knife));
+
+        ResolveLoadedSkin(id, GROUP_AK47, ak);
+        ResolveLoadedSkin(id, GROUP_M4A1, m4);
+        ResolveLoadedSkin(id, GROUP_DEAGLE, deagle);
+        ResolveLoadedSkin(id, GROUP_AWP, awp);
+        ResolveLoadedSkin(id, GROUP_KNIFE, knife);
+    }
+
+    // Load player models (T slot + CT slot). Legacy rows were "model team owned".
+    g_szEquippedPlayerModel[id][0] = 0;
+    g_iEquippedPlayerTeam[id] = 0;
+    g_szEquipT[id][0] = 0;
+    g_szEquipCT[id][0] = 0;
+    g_iPlayerModelOwned[id] = 1;
+
+    formatex(key, charsmax(key), "pmodel#%s", playerId);
+    if (nvault_get(g_Vault, key, value, charsmax(value)))
+    {
+        new sA[32], sB[32], sC[16];
+        parse(value, sA, charsmax(sA), sB, charsmax(sB), sC, charsmax(sC));
+        if (sB[0] >= '0' && sB[0] <= '9' && (!sB[1] || sB[1] == 0 || (sB[1] >= '0' && sB[1] <= '9')))
+        {
+            new iTeam = str_to_num(sB);
+            g_iPlayerModelOwned[id] = str_to_num(sC) | 1;
+            if (iTeam == 1) copy(g_szEquipT[id], charsmax(g_szEquipT[]), sA);
+            else if (iTeam == 2) copy(g_szEquipCT[id], charsmax(g_szEquipCT[]), sA);
+            else
+            {
+                copy(g_szEquipT[id], charsmax(g_szEquipT[]), sA);
+                copy(g_szEquipCT[id], charsmax(g_szEquipCT[]), sA);
+            }
+        }
+        else
+        {
+            copy(g_szEquipT[id], charsmax(g_szEquipT[]), sA);
+            copy(g_szEquipCT[id], charsmax(g_szEquipCT[]), sB);
+            g_iPlayerModelOwned[id] = str_to_num(sC) | 1;
+        }
+    }
+
+    // Load custom assignments
+    LoadCustomSkinsForPlayer(id);
+
+    g_bSkinsLoaded[id] = true;
+    ApplyCurrentWeaponSkin(id);
+}
+
+ResolveLoadedSkin(id, group, const skinName[])
+{
+    new skin = FindSkinIndexByName(group, skinName);
+    if (skin == -1) skin = 0;
+    if (!CanUseSkin(id, group, skin)) skin = 0;
+    g_SelectedSkin[id][group] = skin;
+}
+
+FindSkinIndexByName(group, const skinName[])
+{
+    for (new i = 0; i < g_SkinCount[group]; i++)
+    {
+        if (equali(g_SkinNames[group][i], skinName))
+            return i;
+    }
+    return -1;
+}
+
+LoadCustomSkinsForPlayer(id)
+{
+    for (new g = 0; g < GROUP_COUNT; g++)
+    {
+        g_szCustomWeaponV[id][g][0] = 0;
+        g_szCustomWeaponP[id][g][0] = 0;
+    }
+    g_szCustomPlayerModel[id][0] = 0;
+    g_iCustomPlayerTeam[id] = 0;
+    g_bHasCustomSkinOrder[id] = false;
+
+    if (!is_user_connected(id)) return;
+
+    new szAuth[PLAYER_ID_LEN];
+    GetPlayerIdentifier(id, szAuth, charsmax(szAuth));
+    if (!szAuth[0]) return;
+
+    // Check custom skin order flag
+    if (g_Vault != INVALID_HANDLE)
+    {
+        new szKey[VAULT_KEY_LEN], szVal[32];
+        formatex(szKey, charsmax(szKey), "order#%s", szAuth);
+        if (nvault_get(g_Vault, szKey, szVal, charsmax(szVal)))
+        {
+            g_bHasCustomSkinOrder[id] = bool:(str_to_num(szVal) == 1);
+        }
+    }
+
+    // Read custom_skins.ini
+    if (!file_exists(g_szCustomSkinsPath)) return;
+
+    new fp = fopen(g_szCustomSkinsPath, "rt");
+    if (!fp) return;
+
+    new line[CONFIG_LINE_LEN];
+    new sAuth[PLAYER_ID_LEN], sType[16], sSub[32], sMdl1[MODEL_PATH_LEN], sMdl2[MODEL_PATH_LEN];
+
+    while (!feof(fp))
+    {
+        fgets(fp, line, charsmax(line));
+        trim(line);
+
+        if (!line[0] || line[0] == ';' || line[0] == '#' || (line[0] == '/' && line[1] == '/'))
+            continue;
+
+        sAuth[0] = 0; sType[0] = 0; sSub[0] = 0; sMdl1[0] = 0; sMdl2[0] = 0;
+        new parsed = parse(line,
+            sAuth, charsmax(sAuth),
+            sType, charsmax(sType),
+            sSub, charsmax(sSub),
+            sMdl1, charsmax(sMdl1),
+            sMdl2, charsmax(sMdl2));
+
+        if (parsed < 4) continue;
+        if (!equali(sAuth, szAuth)) continue;
+
+        if (equali(sType, "weapon"))
+        {
+            new group = WeaponToGroup(sSub);
+            if (group != -1 && file_exists(sMdl1) && ModelPrecached(sMdl1))
+            {
+                copy(g_szCustomWeaponV[id][group], MODEL_PATH_LEN - 1, sMdl1);
+                if (parsed >= 5 && sMdl2[0] && !equal(sMdl2, "-") && file_exists(sMdl2) && ModelPrecached(sMdl2))
+                    copy(g_szCustomWeaponP[id][group], MODEL_PATH_LEN - 1, sMdl2);
+                else
+                    copy(g_szCustomWeaponP[id][group], MODEL_PATH_LEN - 1, g_DefaultPlayerModel[group]);
+            }
+        }
+        else if (equali(sType, "player"))
+        {
+            new szPath[128];
+            formatex(szPath, charsmax(szPath), "models/player/%s/%s.mdl", sMdl1, sMdl1);
+            if (file_exists(szPath) && ModelPrecached(szPath))
+            {
+                copy(g_szCustomPlayerModel[id], charsmax(g_szCustomPlayerModel[]), sMdl1);
+                if (equali(sSub, "t")) g_iCustomPlayerTeam[id] = 1;
+                else if (equali(sSub, "ct")) g_iCustomPlayerTeam[id] = 2;
+                else g_iCustomPlayerTeam[id] = 0;
+            }
+        }
+    }
+    fclose(fp);
+
+    LoadForcedPlayerModel(id);
+}
+
+LoadForcedPlayerModel(id)
+{
+    g_szForcedPlayerModel[id][0] = 0;
+    g_iForcedPlayerTeam[id] = 0;
+
+    if (!is_user_connected(id)) return;
+
+    new szAuth[PLAYER_ID_LEN], szName[32];
+    GetPlayerIdentifier(id, szAuth, charsmax(szAuth));
+    get_user_name(id, szName, charsmax(szName));
+
+    new szPath[128];
+    get_configsdir(szPath, charsmax(szPath));
+    add(szPath, charsmax(szPath), "/freenova/player_models.ini");
+
+    if (!file_exists(szPath)) return;
+
+    new fp = fopen(szPath, "rt");
+    if (!fp) return;
+
+    new line[CONFIG_LINE_LEN], sTarget[64], sModel[32], sTeam[8];
+    new szMatchedNameModel[32], iMatchedNameTeam = 0;
+    new bool:bFoundSteamMatch = false;
+
+    while (!feof(fp))
+    {
+        fgets(fp, line, charsmax(line));
+        trim(line);
+        if (!line[0] || line[0] == ';' || line[0] == '#') continue;
+
+        sTarget[0] = 0; sModel[0] = 0; sTeam[0] = 0;
+        new parsed = parse(line, sTarget, charsmax(sTarget), sModel, charsmax(sModel), sTeam, charsmax(sTeam));
+        if (parsed < 2) continue;
+
+        // Check SteamID match (highest priority)
+        if (equali(sTarget, szAuth))
+        {
+            copy(g_szForcedPlayerModel[id], charsmax(g_szForcedPlayerModel[]), sModel);
+            g_iForcedPlayerTeam[id] = str_to_num(sTeam);
+            bFoundSteamMatch = true;
+            break;
+        }
+
+        // Check PlayerName match (secondary priority)
+        if (!bFoundSteamMatch && equali(sTarget, szName))
+        {
+            copy(szMatchedNameModel, charsmax(szMatchedNameModel), sModel);
+            iMatchedNameTeam = str_to_num(sTeam);
+        }
+    }
+    fclose(fp);
+
+    if (!bFoundSteamMatch && szMatchedNameModel[0])
+    {
+        copy(g_szForcedPlayerModel[id], charsmax(g_szForcedPlayerModel[]), szMatchedNameModel);
+        g_iForcedPlayerTeam[id] = iMatchedNameTeam;
+    }
+}
+
+// ============================================================
+// ACCESS & OWNERSHIP CHECKS
+// ============================================================
+
+bool:CanUseSkin(id, group, skin)
+{
+    if (skin < 0 || skin >= g_SkinCount[group])
+        return false;
+
+    if (skin == 0)
+        return true;
+
+    if (g_CoinPrice[group][skin] > 0)
+    {
+        if (!IsSkinOwned(id, group, skin))
+            return false;
+    }
+
+    new reqVip = g_VipOnly[group][skin];
+    if (reqVip > 0)
+    {
+        if (reqVip >= 3)
+        {
+            if (GetPlayerVipTier(id) < FNVIP_ELITE) return false;
+        }
+        else if (reqVip == 2)
+        {
+            if (GetBpLevel(id) < 52) return false;
+        }
+        else if (reqVip == 1)
+        {
+            if (GetPlayerVipTier(id) < FNVIP_VIP) return false;
+        }
+    }
+
+    new reqLvl = g_BPLevel[group][skin];
+    if (reqLvl > 0)
+    {
+        new playerLevel = GetBpLevel(id);
+        if (playerLevel < reqLvl) return false;
+    }
+
+    return true;
+}
+
+bool:IsSkinOwned(id, group, skin)
+{
+    if (skin <= 0) return true;
+    if (get_user_flags(id) & (ADMIN_IMMUNITY | ADMIN_RCON)) return true;
+
+    if (skin < 32)
+        return bool:(g_iOwnedMask[id][group][0] & (1 << skin));
+    else if (skin < 64)
+        return bool:(g_iOwnedMask[id][group][1] & (1 << (skin - 32)));
+
+    return false;
+}
+
+SetSkinOwned(id, group, skin, bool:bOwned)
+{
+    if (skin <= 0 || skin >= MAX_SKINS_PER_GROUP) return;
+
+    if (skin < 32)
+    {
+        if (bOwned) g_iOwnedMask[id][group][0] |= (1 << skin);
+        else g_iOwnedMask[id][group][0] &= ~(1 << skin);
+    }
+    else if (skin < 64)
+    {
+        if (bOwned) g_iOwnedMask[id][group][1] |= (1 << (skin - 32));
+        else g_iOwnedMask[id][group][1] &= ~(1 << (skin - 32));
+    }
+}
+
+GetPlayerVipTier(id)
+{
+    return fnvip_get_tier(id);
+}
+
+WeaponToGroup(const weapon[])
+{
+    if (equali(weapon, "ak") || equali(weapon, "ak47")) return GROUP_AK47;
+    if (equali(weapon, "m4") || equali(weapon, "m4a1")) return GROUP_M4A1;
+    if (equali(weapon, "deagle") || equali(weapon, "deag")) return GROUP_DEAGLE;
+    if (equali(weapon, "awp")) return GROUP_AWP;
+    if (equali(weapon, "knife")) return GROUP_KNIFE;
+    return -1;
+}
+
+WeaponIdToGroup(weaponid)
+{
+    switch (weaponid)
+    {
+        case CSW_AK47:   return GROUP_AK47;
+        case CSW_M4A1:   return GROUP_M4A1;
+        case CSW_DEAGLE: return GROUP_DEAGLE;
+        case CSW_AWP:    return GROUP_AWP;
+        case CSW_KNIFE:  return GROUP_KNIFE;
+    }
+    return -1;
+}
+
+// ============================================================
+// MENUS: MAIN HUB & WEAPON SKINS
+// ============================================================
+
+public CmdOpenSkins(id)
+{
+    if (!is_user_connected(id))
+        return PLUGIN_HANDLED;
+    if (!EnsureSkinsLoaded(id))
+    {
+        client_printcolor(id, "!g[FreeNova Skins] !nSteamID not ready. Try again in a few seconds.");
+        return PLUGIN_HANDLED;
+    }
+
+    ShowMainMenu(id);
+    return PLUGIN_HANDLED;
+}
+
+public CmdOpenModels(id)
+{
+    if (!is_user_connected(id))
+        return PLUGIN_HANDLED;
+    if (!EnsureSkinsLoaded(id))
+    {
+        client_printcolor(id, "!g[FreeNova Skins] !nSteamID not ready. Try again in a few seconds.");
+        return PLUGIN_HANDLED;
+    }
+
+    ShowPlayerModelsMenu(id);
+    return PLUGIN_HANDLED;
+}
+
+public Cmd_CustomSkinCmd(id)
+{
+    if (!is_user_connected(id))
+        return PLUGIN_HANDLED;
+
+    ShowCustomOrderMenu(id);
+    return PLUGIN_HANDLED;
+}
+
+ShowMainMenu(id)
+{
+    new iCoins = LibraryExists("menabp", LibType_Library) ? menabp_get_coins(id) : 0;
+    new szTitle[96];
+    FN_MenuTitle(szTitle, charsmax(szTitle), "Skins & Models", iCoins);
+
+    new menu = menu_create(szTitle, "MainMenuHandler");
+    new info[8];
+
+    for (new group = 0; group < GROUP_COUNT; group++)
+    {
+        num_to_str(group, info, charsmax(info));
+        menu_additem(menu, g_GroupNames[group], info);
+    }
+
+    menu_additem(menu, fmt("\yOrder Custom Skin / Model \r%dc", get_pcvar_num(g_pCustomOrderCost)), "11");
+    menu_additem(menu, "\wMy Custom Skin Status", "12");
+
+    FN_MenuFinish(menu, false);
+    WmDisplayMenu(id, menu);
+}
+
+public MainMenuHandler(id, menu, item)
+{
+    if (item == MENU_EXIT)
+    {
+        menu_destroy(menu);
+        return PLUGIN_HANDLED;
+    }
+
+    new data[8], name[64], access, callback;
+    menu_item_getinfo(menu, item, access, data, charsmax(data), name, charsmax(name), callback);
+    new choice = str_to_num(data);
+    menu_destroy(menu);
+
+    if (choice < GROUP_COUNT)
+        ShowSkinMenu(id, choice);
+    else if (choice == 11)
+        ShowCustomOrderMenu(id);
+    else if (choice == 12)
+        ShowCustomStatusMenu(id);
+
+    return PLUGIN_HANDLED;
+}
+
+ShowSkinMenu(id, group)
+{
+    new iCoins = LibraryExists("menabp", LibType_Library) ? menabp_get_coins(id) : 0;
+    new title[96];
+    FN_MenuTitle(title, charsmax(title), g_GroupNames[group], iCoins);
+
+    new menu = menu_create(title, "SkinMenuHandler");
+    new info[16], itemText[128];
+
+    for (new i = 0; i < g_SkinCount[group]; i++)
+    {
+        new bool:canUse = CanUseSkin(id, group, i);
+        new vipTier = g_VipOnly[group][i];
+        new bpLevel = g_BPLevel[group][i];
+        new coinPrice = g_CoinPrice[group][i];
+        new isSelected = (g_SelectedSkin[id][group] == i);
+
+        new statusTag[48];
+        statusTag[0] = 0;
+
+        if (vipTier == 2)
+            copy(statusTag, charsmax(statusTag), "\r[LEGEND]");
+        else if (vipTier == 1)
+            copy(statusTag, charsmax(statusTag), "\r[VIP]");
+
+        if (bpLevel > 0)
+        {
+            new bpTag[16];
+            formatex(bpTag, charsmax(bpTag), "\y[Lv.%d]", bpLevel);
+            add(statusTag, charsmax(statusTag), bpTag);
+        }
+
+        new iCallback = -1;
+        if (canUse)
+        {
+            if (isSelected)
+                formatex(itemText, charsmax(itemText), "\w%s %s \y(EQUIPPED)", g_SkinNames[group][i], statusTag);
+            else
+                formatex(itemText, charsmax(itemText), "\w%s %s \d(OWNED)", g_SkinNames[group][i], statusTag);
+        }
+        else if (coinPrice > 0 && !IsSkinOwned(id, group, i))
+        {
+            if (iCoins < coinPrice)
+            {
+                formatex(itemText, charsmax(itemText), "\d%s \r%dc", g_SkinNames[group][i], coinPrice);
+                iCallback = menu_makecallback("SkinNeedCallback");
+            }
+            else
+                formatex(itemText, charsmax(itemText), "\y%s \r[%dc BUY]", g_SkinNames[group][i], coinPrice);
+        }
+        else
+        {
+            new szLock[32];
+            if (vipTier == 1)
+                copy(szLock, charsmax(szLock), "VIP required");
+            else if (vipTier == 2)
+                copy(szLock, charsmax(szLock), "Legend required");
+            else if (bpLevel > 0)
+                formatex(szLock, charsmax(szLock), "Tier %d required", bpLevel);
+            else
+                copy(szLock, charsmax(szLock), "LOCK");
+            formatex(itemText, charsmax(itemText), "\d%s %s \r[%s]", g_SkinNames[group][i], statusTag, szLock);
+        }
+
+        formatex(info, charsmax(info), "%d %d", group, i);
+        menu_additem(menu, itemText, info, 0, iCallback);
+    }
+
+    FN_MenuFinish(menu, true);
+    WmDisplayMenu(id, menu);
+}
+
+public SkinNeedCallback(id, menu, item)
+{
+    return ITEM_DISABLED;
+}
+
+public SkinMenuHandler(id, menu, item)
+{
+    if (item == MENU_EXIT)
+    {
+        menu_destroy(menu);
+        ShowMainMenu(id);
+        return PLUGIN_HANDLED;
+    }
+
+    new data[16], name[64], access, callback;
+    new sGroup[8], sSkin[8];
+
+    menu_item_getinfo(menu, item, access, data, charsmax(data), name, charsmax(name), callback);
+    parse(data, sGroup, charsmax(sGroup), sSkin, charsmax(sSkin));
+
+    new group = str_to_num(sGroup);
+    new skin = str_to_num(sSkin);
+    menu_destroy(menu);
+
+    if (group < 0 || group >= GROUP_COUNT || skin < 0 || skin >= g_SkinCount[group])
+        return PLUGIN_HANDLED;
+
+    // Check if player owns/can use skin
+    if (CanUseSkin(id, group, skin))
+    {
+        g_SelectedSkin[id][group] = skin;
+        ApplyCurrentWeaponSkin(id);
+        SavePlayerSkinsVault(id);
+
+        emit_sound(id, CHAN_ITEM, "items/suitchargeno1.wav", 1.0, ATTN_NORM, 0, PITCH_NORM);
+        client_printcolor(id, "!g[FreeNova Skins] !nEquipped: !g%s!n.", g_SkinNames[group][skin]);
+        ShowSkinMenu(id, group);
+        return PLUGIN_HANDLED;
+    }
+
+    // Skin is not currently usable: check coin purchase
+    new iCost = g_CoinPrice[group][skin];
+    if (iCost > 0 && !IsSkinOwned(id, group, skin))
+    {
+        new iCoins = LibraryExists("menabp", LibType_Library) ? menabp_get_coins(id) : 0;
+        if (iCoins < iCost)
+        {
+            client_printcolor(id, "!g[FreeNova Skins] !nThis skin costs !g%d Coins!n. You only have: !t%d Coins!n.", iCost, iCoins);
+            emit_sound(id, CHAN_ITEM, "buttons/button10.wav", 1.0, ATTN_NORM, 0, PITCH_NORM);
+            ShowSkinMenu(id, group);
+            return PLUGIN_HANDLED;
+        }
+
+        if (!CanMeetSkinGates(id, group, skin))
+        {
+            client_printcolor(id, "!g[FreeNova Skins] !nYou do not meet this skin's VIP/tier requirements.");
+            emit_sound(id, CHAN_ITEM, "buttons/button10.wav", 1.0, ATTN_NORM, 0, PITCH_NORM);
+            ShowSkinMenu(id, group);
+            return PLUGIN_HANDLED;
+        }
+
+        if (iCost >= 10000)
+        {
+            g_iPendingBuyGroup[id] = group;
+            g_iPendingBuySkin[id] = skin;
+            ShowSkinBuyConfirm(id, group, skin, iCost);
+            return PLUGIN_HANDLED;
+        }
+
+        ChargeAndEquipSkin(id, group, skin, iCost);
+        ShowSkinMenu(id, group);
+        return PLUGIN_HANDLED;
+    }
+
+    // Locked by VIP or Level without coin option
+    if (g_VipOnly[group][skin] > 0)
+    {
+        if (g_VipOnly[group][skin] == 2)
+            client_printcolor(id, "!g[FreeNova Skins] !nRequires BattlePass Level 52 (Legend)!");
+        else
+            client_printcolor(id, "!g[FreeNova Skins] !nRequires VIP Status!");
+    }
+    else if (g_BPLevel[group][skin] > 0)
+    {
+        client_printcolor(id, "!g[FreeNova Skins] !nRequires BattlePass Tier %d!", g_BPLevel[group][skin]);
+    }
+
+    emit_sound(id, CHAN_ITEM, "buttons/button10.wav", 1.0, ATTN_NORM, 0, PITCH_NORM);
+    ShowSkinMenu(id, group);
+    return PLUGIN_HANDLED;
+}
+
+ChargeAndEquipSkin(id, group, skin, iCost)
+{
+    if (!EnsureSkinsLoaded(id))
+        return;
+    // Final gate check before money moves. Never rely on the menu snapshot.
+    if (!CanMeetSkinGates(id, group, skin))
+    {
+        client_printcolor(id, "!g[FreeNova Skins] !nYou no longer meet this skin's requirements.");
+        return;
+    }
+    if (!WmDebitCoins(id, iCost))
+    {
+        client_printcolor(id, "!g[FreeNova Skins] !nPurchase failed. Shop data still loading or not enough coins.");
+        return;
+    }
+    SetSkinOwned(id, group, skin, true);
+    g_SelectedSkin[id][group] = skin;
+    SavePlayerSkinsVault(id);
+    ApplyCurrentWeaponSkin(id);
+    emit_sound(id, CHAN_ITEM, "items/suitchargeno1.wav", 1.0, ATTN_NORM, 0, PITCH_NORM);
+    client_printcolor(id, "!g[FreeNova Skins] !yPurchased and equipped !g%s!n for !g%d Coins!n!", g_SkinNames[group][skin], iCost);
+}
+
+ShowSkinBuyConfirm(id, group, skin, iCost)
+{
+    new szTitle[96];
+    new szBase[96];
+    FN_MenuTitle(szBase, charsmax(szBase), "Confirm purchase");
+    formatex(szTitle, charsmax(szTitle), "%s^n\w%s \r%dc?", szBase, g_SkinNames[group][skin], iCost);
+    new menu = menu_create(szTitle, "SkinBuyConfirmHandler");
+    menu_additem(menu, "\yConfirm purchase", "1");
+    menu_additem(menu, "\wCancel", "0");
+    menu_setprop(menu, MPROP_EXITNAME, "\wCancel");
+    menu_setprop(menu, MPROP_NUMBER_COLOR, "\y");
+    WmDisplayMenu(id, menu);
+}
+
+public SkinBuyConfirmHandler(id, menu, item)
+{
+    new group = g_iPendingBuyGroup[id];
+    new skin = g_iPendingBuySkin[id];
+    g_iPendingBuyGroup[id] = -1;
+    g_iPendingBuySkin[id] = -1;
+
+    if (item == MENU_EXIT)
+    {
+        menu_destroy(menu);
+        if (group >= 0) ShowSkinMenu(id, group);
+        return PLUGIN_HANDLED;
+    }
+
+    new data[8], name[64], access, callback;
+    menu_item_getinfo(menu, item, access, data, charsmax(data), name, charsmax(name), callback);
+    menu_destroy(menu);
+
+    if (str_to_num(data) != 1 || group < 0 || skin < 0)
+    {
+        if (group >= 0) ShowSkinMenu(id, group);
+        return PLUGIN_HANDLED;
+    }
+
+    new iCost = g_CoinPrice[group][skin];
+    new iCoins = LibraryExists("menabp", LibType_Library) ? menabp_get_coins(id) : 0;
+    if (iCost < 10000 || IsSkinOwned(id, group, skin) || iCoins < iCost)
+    {
+        ShowSkinMenu(id, group);
+        return PLUGIN_HANDLED;
+    }
+
+    // Re-validate access gates at confirm time: VIP tier or BP level may
+    // have lapsed since the menu opened (e.g. event VIP expiry). Use the
+    // gate-only check: CanUseSkin() also requires ownership, which an
+    // unowned coin purchase does not have yet.
+    if (!CanMeetSkinGates(id, group, skin))
+    {
+        client_printcolor(id, "!g[FreeNova Skins] !nThis skin is no longer available to you!");
+        emit_sound(id, CHAN_ITEM, "buttons/button10.wav", 1.0, ATTN_NORM, 0, PITCH_NORM);
+        ShowSkinMenu(id, group);
+        return PLUGIN_HANDLED;
+    }
+
+    ChargeAndEquipSkin(id, group, skin, iCost);
+    ShowSkinMenu(id, group);
+    return PLUGIN_HANDLED;
+}
+
+// ============================================================
+// MENUS: PREMADE PLAYER MODELS
+// ============================================================
+
+ShowPlayerModelsMenu(id)
+{
+    new iCoins = LibraryExists("menabp", LibType_Library) ? menabp_get_coins(id) : 0;
+    new szTitle[96];
+    FN_MenuTitle(szTitle, charsmax(szTitle), "Models", iCoins);
+
+    new menu = menu_create(szTitle, "PlayerModelsMenuHandler");
+    menu_additem(menu, fmt("\wT  model \d[ %s ]", g_szEquipT[id][0] ? g_szEquipT[id] : "default"), "t");
+    menu_additem(menu, fmt("\wCT model \d[ %s ]", g_szEquipCT[id][0] ? g_szEquipCT[id] : "default"), "ct");
+    menu_additem(menu, "\yUnequip both", "off");
+    FN_MenuFinish(menu, true);
+    WmDisplayMenu(id, menu);
+}
+
+public PlayerModelsMenuHandler(id, menu, item)
+{
+    if (item == MENU_EXIT)
+    {
+        menu_destroy(menu);
+        ShowMainMenu(id);
+        return PLUGIN_HANDLED;
+    }
+
+    new data[8], name[64], access, callback;
+    menu_item_getinfo(menu, item, access, data, charsmax(data), name, charsmax(name), callback);
+    menu_destroy(menu);
+
+    if (equal(data, "off"))
+    {
+        g_szEquipT[id][0] = 0;
+        g_szEquipCT[id][0] = 0;
+        SavePlayerSkinsVault(id);
+        if (is_user_alive(id))
+            cs_reset_user_model(id);
+        client_printcolor(id, "!g[FreeNova] !nT and CT models reset.");
+        ShowPlayerModelsMenu(id);
+        return PLUGIN_HANDLED;
+    }
+    if (equal(data, "t"))
+    {
+        ShowTeamModelPicker(id, 1);
+        return PLUGIN_HANDLED;
+    }
+    if (equal(data, "ct"))
+    {
+        ShowTeamModelPicker(id, 2);
+        return PLUGIN_HANDLED;
+    }
+    return PLUGIN_HANDLED;
+}
+
+ShowTeamModelPicker(id, iTeam)
+{
+    new szTitle[64];
+    FN_MenuTitle(szTitle, charsmax(szTitle), iTeam == 1 ? "Equip T model" : "Equip CT model");
+    new menu = menu_create(szTitle, "TeamModelPickerHandler");
+    menu_additem(menu, "\wDefault CS 1.6", iTeam == 1 ? "t0" : "c0");
+    for (new i = 1; i < sizeof(g_PremadePlayerModels); i++)
+    {
+        new iNeed = g_PremadePlayerModels[i][PMODEL_TEAM];
+        if (iNeed != 0 && iNeed != iTeam)
+            continue;
+        new info[8];
+        formatex(info, charsmax(info), "%s%d", iTeam == 1 ? "t" : "c", i);
+        new bool:bOwned = bool:(g_iPlayerModelOwned[id] & (1 << i)) || (get_user_flags(id) & (ADMIN_IMMUNITY | ADMIN_RCON));
+        new szItem[96];
+        new iCallback = -1;
+        if (bOwned && PModelVipBlocked(id, g_PremadePlayerModels[i][PMODEL_FILE]))
+        {
+            formatex(szItem, charsmax(szItem), "\d%s \r[VIP required]", g_PremadePlayerModels[i][PMODEL_NAME]);
+            iCallback = menu_makecallback("SkinNeedCallback");
+        }
+        else if (bOwned)
+            formatex(szItem, charsmax(szItem), "\w%s \d(OWNED)", g_PremadePlayerModels[i][PMODEL_NAME]);
+        else if (g_PremadePlayerModels[i][PMODEL_LEVEL] > 0)
+        {
+            formatex(szItem, charsmax(szItem), "\d%s \r[BP Lv.%d]", g_PremadePlayerModels[i][PMODEL_NAME], g_PremadePlayerModels[i][PMODEL_LEVEL]);
+            iCallback = menu_makecallback("SkinNeedCallback");
+        }
+        else
+        {
+            formatex(szItem, charsmax(szItem), "\d%s \r[locked]", g_PremadePlayerModels[i][PMODEL_NAME]);
+            iCallback = menu_makecallback("SkinNeedCallback");
+        }
+        menu_additem(menu, szItem, info, 0, iCallback);
+    }
+    FN_MenuFinish(menu, true);
+    WmDisplayMenu(id, menu);
+}
+
+public TeamModelPickerHandler(id, menu, item)
+{
+    if (item == MENU_EXIT)
+    {
+        menu_destroy(menu);
+        ShowPlayerModelsMenu(id);
+        return PLUGIN_HANDLED;
+    }
+    new data[8], name[64], access, callback;
+    menu_item_getinfo(menu, item, access, data, charsmax(data), name, charsmax(name), callback);
+    menu_destroy(menu);
+
+    new iTeam = (data[0] == 't') ? 1 : 2;
+    new idx = str_to_num(data[1]);
+
+    if (idx == 0)
+    {
+        if (iTeam == 1) g_szEquipT[id][0] = 0;
+        else g_szEquipCT[id][0] = 0;
+        SavePlayerSkinsVault(id);
+        if (is_user_alive(id)) ApplySpawnPlayerModel(id);
+        ShowPlayerModelsMenu(id);
+        return PLUGIN_HANDLED;
+    }
+
+    if (idx < 0 || idx >= sizeof(g_PremadePlayerModels))
+        return PLUGIN_HANDLED;
+
+    new bool:bOwned = bool:(g_iPlayerModelOwned[id] & (1 << idx)) || (get_user_flags(id) & (ADMIN_IMMUNITY | ADMIN_RCON));
+
+    if (!bOwned)
+    {
+        if (g_PremadePlayerModels[idx][PMODEL_VIP] > 0
+            && fnvip_get_tier(id) < g_PremadePlayerModels[idx][PMODEL_VIP])
+        {
+            client_printcolor(id, "!g[FreeNova Skins] !nVIP required for this model.");
+            ShowTeamModelPicker(id, iTeam);
+            return PLUGIN_HANDLED;
+        }
+        if (g_PremadePlayerModels[idx][PMODEL_LEVEL] > 0)
+        {
+            client_printcolor(id, "!g[FreeNova Skins] !nReach Battle Pass !gTier %d!n to unlock this model.", g_PremadePlayerModels[idx][PMODEL_LEVEL]);
+            ShowTeamModelPicker(id, iTeam);
+            return PLUGIN_HANDLED;
+        }
+        // Coin purchases of player models are retired: owned, VIP/BP-gated
+        // and default models equip freely; anything else stays locked.
+        // (Web-panel grants via fn_models_unlock still work for staff.)
+        client_printcolor(id, "!g[FreeNova Skins] !nThis model is not available.");
+        emit_sound(id, CHAN_ITEM, "buttons/button10.wav", 1.0, ATTN_NORM, 0, PITCH_NORM);
+        ShowPlayerModelsMenu(id);
+        return PLUGIN_HANDLED;
+    }
+    else if (PModelVipBlocked(id, g_PremadePlayerModels[idx][PMODEL_FILE]))
+    {
+        client_printcolor(id, "!g[FreeNova Skins] !nOwned, but VIP required to equip.");
+        ShowTeamModelPicker(id, iTeam);
+        return PLUGIN_HANDLED;
+    }
+
+    if (iTeam == 1)
+        copy(g_szEquipT[id], charsmax(g_szEquipT[]), g_PremadePlayerModels[idx][PMODEL_FILE]);
+    else
+        copy(g_szEquipCT[id], charsmax(g_szEquipCT[]), g_PremadePlayerModels[idx][PMODEL_FILE]);
+    SavePlayerSkinsVault(id);
+    if (is_user_alive(id))
+        ApplySpawnPlayerModel(id);
+
+    emit_sound(id, CHAN_ITEM, "items/suitchargeno1.wav", 1.0, ATTN_NORM, 0, PITCH_NORM);
+    client_printcolor(id, "!g[FreeNova Skins] !nEquipped player model: !g%s!n!", g_PremadePlayerModels[idx][PMODEL_NAME]);
+    ShowPlayerModelsMenu(id);
+    return PLUGIN_HANDLED;
+}
+
+// ============================================================
+// MENUS: CUSTOM MODEL / WEAPON ORDERS & STATUS
+// ============================================================
+
+ShowCustomOrderMenu(id)
+{
+    new iCost = get_pcvar_num(g_pCustomOrderCost);
+    new iCoins = LibraryExists("menabp", LibType_Library) ? menabp_get_coins(id) : 0;
+
+    new szTitle[128];
+    new szBase2[96];
+    FN_MenuTitle(szBase2, charsmax(szBase2), "Order Custom Model / Skin", iCoins);
+    formatex(szTitle, charsmax(szTitle), "%s^n\yCost: \r%d Coins", szBase2, iCost);
+
+    new menu = menu_create(szTitle, "CustomOrderMenuHandler");
+
+    if (g_bHasCustomSkinOrder[id])
+    {
+        menu_additem(menu, "\yView in-game order status", "1");
+        menu_additem(menu, "\wHow assignment works \d(in-game)", "2");
+    }
+    else
+    {
+        if (iCoins < iCost)
+        {
+            menu_additem(menu, fmt("\dConfirm Order \r%dc", iCost), "1", 0, menu_makecallback("SkinNeedCallback"));
+        }
+        else
+            menu_additem(menu, fmt("\yConfirm Order & Deduct \r%d Coins", iCost), "1");
+        menu_additem(menu, "\wHow does this work? \d(in-game)", "2");
+    }
+
+    FN_MenuFinish(menu, true);
+    WmDisplayMenu(id, menu);
+}
+
+public CustomOrderMenuHandler(id, menu, item)
+{
+    if (item == MENU_EXIT)
+    {
+        menu_destroy(menu);
+        ShowMainMenu(id);
+        return PLUGIN_HANDLED;
+    }
+
+    new data[8], name[64], access, callback;
+    menu_item_getinfo(menu, item, access, data, charsmax(data), name, charsmax(name), callback);
+    new choice = str_to_num(data);
+    menu_destroy(menu);
+
+    if (choice == 1)
+    {
+        if (g_bHasCustomSkinOrder[id])
+        {
+            ShowCustomStatusMenu(id);
+            return PLUGIN_HANDLED;
+        }
+
+        new iCost = get_pcvar_num(g_pCustomOrderCost);
+        new iCoins = LibraryExists("menabp", LibType_Library) ? menabp_get_coins(id) : 0;
+
+        if (iCoins < iCost)
+        {
+            client_printcolor(id, "!g[FreeNova Skins] !nCustom Model orders cost !g%d Coins!n. You only have: !t%d Coins!n.", iCost, iCoins);
+            emit_sound(id, CHAN_ITEM, "buttons/button10.wav", 1.0, ATTN_NORM, 0, PITCH_NORM);
+            ShowCustomOrderMenu(id);
+            return PLUGIN_HANDLED;
+        }
+
+        if (!WmDebitCoins(id, iCost))
+        {
+            client_printcolor(id, "!g[FreeNova Skins] !nOrder failed. Shop data still loading or not enough coins.");
+            ShowCustomOrderMenu(id);
+            return PLUGIN_HANDLED;
+        }
+        g_bHasCustomSkinOrder[id] = true;
+        SavePlayerSkinsVault(id);
+
+        new szName[32], szAuth[PLAYER_ID_LEN], szIp[32];
+        get_user_name(id, szName, charsmax(szName));
+        GetPlayerIdentifier(id, szAuth, charsmax(szAuth));
+        get_user_ip(id, szIp, charsmax(szIp), 1);
+
+        log_to_file("custom_skins_orders.log", "[ORDER] Player: ^"%s^" | Auth: ^"%s^" | IP: ^"%s^" | Coins: %d", szName, szAuth, szIp, iCost);
+
+        emit_sound(id, CHAN_ITEM, "items/suitchargeno1.wav", 1.0, ATTN_NORM, 0, PITCH_NORM);
+        client_printcolor(id, "!g[FreeNova Skins] !yORDER CONFIRMED! !n%d Coins deducted.", iCost);
+        client_printcolor(id, "!g[FreeNova Skins] !nOpen !tMy Custom Skin Status!n in this menu. SteamID: !t%s!n", szAuth);
+
+        new szAdminMsg[192];
+        formatex(szAdminMsg, charsmax(szAdminMsg), "!g[FreeNova Admin] !t%s !nordered a !gCustom Skin/Model!n! SteamID: !t%s!n. Use !tfn_skin_orders!n.", szName, szAuth);
+        for (new i = 1; i <= MAX_PLAYERS; i++)
+        {
+            if (is_user_connected(i) && (get_user_flags(i) & (ADMIN_RCON | ADMIN_BAN | ADMIN_IMMUNITY)))
+            {
+                client_printcolor(i, szAdminMsg);
+            }
+        }
+
+        ShowCustomOrderMenu(id);
+    }
+    else if (choice == 2)
+    {
+        client_printcolor(id, "!g[FreeNova Skins] !y=== CUSTOM MODEL / SKIN (IN-GAME) ===");
+        client_printcolor(id, "!g[FreeNova Skins] !n1. Place an order for !g%d Coins!n in /skins.", get_pcvar_num(g_pCustomOrderCost));
+        client_printcolor(id, "!g[FreeNova Skins] !n2. Open !tMy Custom Skin Status!n in this menu for SteamID and assignment state.");
+        client_printcolor(id, "!g[FreeNova Skins] !n3. An in-game admin assigns the model with !tfn_setskin!n.");
+        client_printcolor(id, "!g[FreeNova Skins] !n4. Assigned models appear in this status menu - no external site required.");
+        ShowCustomStatusMenu(id);
+    }
+
+    return PLUGIN_HANDLED;
+}
+
+ShowCustomStatusMenu(id)
+{
+    new szAuth[PLAYER_ID_LEN];
+    GetPlayerIdentifier(id, szAuth, charsmax(szAuth));
+
+    new szTitle[128];
+    new szBase3[96];
+    FN_MenuTitle(szBase3, charsmax(szBase3), "My Custom Skin Status");
+    formatex(szTitle, charsmax(szTitle), "%s^n\dSteamID: \y%s", szBase3, szAuth);
+
+    new menu = menu_create(szTitle, "CustomStatusMenuHandler");
+
+    new itemText[128];
+    if (g_bHasCustomSkinOrder[id])
+        copy(itemText, charsmax(itemText), "\yOrder Status: \rPENDING OWNER ASSIGNMENT");
+    else
+        copy(itemText, charsmax(itemText), "\yOrder Status: \dNo Pending Orders");
+    menu_additem(menu, itemText, "1");
+
+    if (g_szCustomPlayerModel[id][0])
+        formatex(itemText, charsmax(itemText), "\wAssigned Player Model: \g%s", g_szCustomPlayerModel[id]);
+    else if (g_szEquippedPlayerModel[id][0])
+        formatex(itemText, charsmax(itemText), "\wEquipped Player Model: \y%s", g_szEquippedPlayerModel[id]);
+    else
+        copy(itemText, charsmax(itemText), "\wPlayer Model: \dDefault CS 1.6");
+    menu_additem(menu, itemText, "2");
+
+    for (new g = 0; g < GROUP_COUNT; g++)
+    {
+        if (g_szCustomWeaponV[id][g][0])
+            formatex(itemText, charsmax(itemText), "\w%s: \g[OWNER ASSIGNED] %s", g_GroupNames[g], g_szCustomWeaponV[id][g]);
+        else if (g_SelectedSkin[id][g] > 0)
+            formatex(itemText, charsmax(itemText), "\w%s: \y%s", g_GroupNames[g], g_SkinNames[g][g_SelectedSkin[id][g]]);
+        else
+            formatex(itemText, charsmax(itemText), "\w%s: \dDefault", g_GroupNames[g]);
+        menu_additem(menu, itemText, "3");
+    }
+
+    FN_MenuFinish(menu, true);
+    WmDisplayMenu(id, menu);
+}
+
+public CustomStatusMenuHandler(id, menu, item)
+{
+    menu_destroy(menu);
+    ShowMainMenu(id);
+    return PLUGIN_HANDLED;
+}
+
+// ============================================================
+// ADMIN CONSOLE COMMANDS (ASSIGNMENT SYSTEM)
+// ============================================================
+
+public Cmd_AdminSetSkin(id, level, cid)
+{
+    if (!cmd_access(id, level, cid, 5))
+        return PLUGIN_HANDLED;
+
+    new szTarget[64], szType[16], szSub[32], szModel1[128], szModel2[128];
+    read_argv(1, szTarget, charsmax(szTarget));
+    read_argv(2, szType, charsmax(szType));
+    read_argv(3, szSub, charsmax(szSub));
+    read_argv(4, szModel1, charsmax(szModel1));
+    read_argv(5, szModel2, charsmax(szModel2));
+
+    new target = cmd_target(id, szTarget, CMDTARGET_ALLOW_SELF);
+    new szAuth[PLAYER_ID_LEN];
+
+    if (target)
+    {
+        GetPlayerIdentifier(target, szAuth, charsmax(szAuth));
+        if (!szAuth[0])
+        {
+            console_print(id, "[FreeNova Skins] Target SteamID is pending. Retry after they fully connect.");
+            return PLUGIN_HANDLED;
+        }
+    }
+    else
+    {
+        if (containi(szTarget, "STEAM_") != -1 || containi(szTarget, "VALVE_") != -1)
+            copy(szAuth, charsmax(szAuth), szTarget);
+        else
+        {
+            console_print(id, "[FreeNova Skins] Player '%s' not found.", szTarget);
+            return PLUGIN_HANDLED;
+        }
+    }
+
+    if (equali(szType, "weapon"))
+    {
+        new group = WeaponToGroup(szSub);
+        if (group == -1)
+        {
+            console_print(id, "[FreeNova Skins] Invalid weapon '%s'. Options: ak47, m4a1, deagle, awp, knife.", szSub);
+            return PLUGIN_HANDLED;
+        }
+
+        if (!file_exists(szModel1))
+        {
+            console_print(id, "[FreeNova Skins] Error: Model file does not exist on disk: %s", szModel1);
+            return PLUGIN_HANDLED;
+        }
+
+        if (!szModel2[0] || equal(szModel2, "-"))
+            copy(szModel2, charsmax(szModel2), "-");
+        else if (!file_exists(szModel2))
+        {
+            console_print(id, "[FreeNova Skins] Error: Player model does not exist on disk: %s", szModel2);
+            return PLUGIN_HANDLED;
+        }
+
+        new fp = fopen(g_szCustomSkinsPath, "a+t");
+        if (fp)
+        {
+            fprintf(fp, "%s weapon %s %s %s^n", szAuth, szSub, szModel1, szModel2);
+            fclose(fp);
+        }
+
+        if (target && is_user_connected(target) && ModelPrecached(szModel1)
+            && (equal(szModel2, "-") || ModelPrecached(szModel2)))
+        {
+            copy(g_szCustomWeaponV[target][group], MODEL_PATH_LEN - 1, szModel1);
+            if (!equal(szModel2, "-"))
+                copy(g_szCustomWeaponP[target][group], MODEL_PATH_LEN - 1, szModel2);
+            else
+                copy(g_szCustomWeaponP[target][group], MODEL_PATH_LEN - 1, g_DefaultPlayerModel[group]);
+
+            g_bHasCustomSkinOrder[target] = false;
+            SavePlayerSkinsVault(target);
+            ApplyCurrentWeaponSkin(target);
+
+            emit_sound(target, CHAN_ITEM, "items/suitchargeno1.wav", 1.0, ATTN_NORM, 0, PITCH_NORM);
+            client_printcolor(target, "!g[FreeNova Skins] !tServer Owner !nhas assigned custom weapon skin !g%s!n to you!", szModel1);
+            console_print(id, "[FreeNova Skins] Assigned weapon skin '%s' to %s (%s).", szModel1, szTarget, szAuth);
+        }
+        else
+        {
+            console_print(id, "[FreeNova Skins] Wrote custom_skins.ini for %s. Model was not precached this map - applies next map. Never applying unprecached mdl.", szAuth);
+        }
+    }
+    else if (equali(szType, "player"))
+    {
+        new szPath[128];
+        formatex(szPath, charsmax(szPath), "models/player/%s/%s.mdl", szModel1, szModel1);
+        if (!file_exists(szPath))
+        {
+            console_print(id, "[FreeNova Skins] Error: Player model file not found: %s", szPath);
+            return PLUGIN_HANDLED;
+        }
+
+        new fp = fopen(g_szCustomSkinsPath, "a+t");
+        if (fp)
+        {
+            fprintf(fp, "%s player %s %s^n", szAuth, szSub, szModel1);
+            fclose(fp);
+        }
+
+        if (target && is_user_connected(target) && ModelPrecached(szPath))
+        {
+            copy(g_szCustomPlayerModel[target], charsmax(g_szCustomPlayerModel[]), szModel1);
+            if (equali(szSub, "t")) g_iCustomPlayerTeam[target] = 1;
+            else if (equali(szSub, "ct")) g_iCustomPlayerTeam[target] = 2;
+            else g_iCustomPlayerTeam[target] = 0;
+
+            g_bHasCustomSkinOrder[target] = false;
+            SavePlayerSkinsVault(target);
+
+            if (is_user_alive(target))
+                cs_set_user_model(target, szModel1);
+
+            emit_sound(target, CHAN_ITEM, "items/suitchargeno1.wav", 1.0, ATTN_NORM, 0, PITCH_NORM);
+            client_printcolor(target, "!g[FreeNova Skins] !tServer Owner !nhas assigned custom player model !g%s!n to you!", szModel1);
+            console_print(id, "[FreeNova Skins] Assigned player model '%s' to %s (%s).", szModel1, szTarget, szAuth);
+        }
+        else
+        {
+            console_print(id, "[FreeNova Skins] Wrote custom_skins.ini for %s. Model was not precached this map - applies next map. Never applying unprecached mdl.", szAuth);
+        }
+    }
+    else
+    {
+        console_print(id, "[FreeNova Skins] Unknown type '%s'. Use 'weapon' or 'player'.", szType);
+    }
+
+    return PLUGIN_HANDLED;
+}
+
+public Cmd_AdminRemoveSkin(id, level, cid)
+{
+    if (!cmd_access(id, level, cid, 2))
+        return PLUGIN_HANDLED;
+
+    new szTarget[64], szTypeFilter[16];
+    read_argv(1, szTarget, charsmax(szTarget));
+    read_argv(2, szTypeFilter, charsmax(szTypeFilter));
+
+    new target = cmd_target(id, szTarget, CMDTARGET_ALLOW_SELF);
+    new szAuth[PLAYER_ID_LEN];
+
+    if (target)
+        GetPlayerIdentifier(target, szAuth, charsmax(szAuth));
+    else
+        copy(szAuth, charsmax(szAuth), szTarget);
+
+    if (!file_exists(g_szCustomSkinsPath))
+    {
+        console_print(id, "[FreeNova Skins] custom_skins.ini does not exist.");
+        return PLUGIN_HANDLED;
+    }
+
+    new fpIn = fopen(g_szCustomSkinsPath, "rt");
+    if (!fpIn) return PLUGIN_HANDLED;
+
+    new szTempFile[128];
+    formatex(szTempFile, charsmax(szTempFile), "%s.tmp", g_szCustomSkinsPath);
+    new fpOut = fopen(szTempFile, "wt");
+    if (!fpOut) { fclose(fpIn); return PLUGIN_HANDLED; }
+
+    new line[CONFIG_LINE_LEN], sAuth[PLAYER_ID_LEN], sType[16], sSub[32], sMdl1[MODEL_PATH_LEN], sMdl2[MODEL_PATH_LEN];
+    new iRemoved = 0;
+
+    while (!feof(fpIn))
+    {
+        fgets(fpIn, line, charsmax(line));
+        trim(line);
+        if (!line[0]) continue;
+
+        if (line[0] == ';' || line[0] == '#' || (line[0] == '/' && line[1] == '/'))
+        {
+            fprintf(fpOut, "%s^n", line);
+            continue;
+        }
+
+        sAuth[0] = 0; sType[0] = 0;
+        parse(line, sAuth, charsmax(sAuth), sType, charsmax(sType), sSub, charsmax(sSub), sMdl1, charsmax(sMdl1), sMdl2, charsmax(sMdl2));
+
+        if (equali(sAuth, szAuth))
+        {
+            if (!szTypeFilter[0] || equali(szTypeFilter, "all") || equali(szTypeFilter, sType))
+            {
+                iRemoved++;
+                continue;
+            }
+        }
+        fprintf(fpOut, "%s^n", line);
+    }
+    fclose(fpIn);
+    fclose(fpOut);
+
+    delete_file(g_szCustomSkinsPath);
+    new iRetry;
+    for (iRetry = 0; iRetry < 8 && file_exists(g_szCustomSkinsPath); iRetry++) {}
+    if (file_exists(g_szCustomSkinsPath))
+    {
+        log_amx("[FreeNova Skins] Could not replace custom_skins.ini after %d retries; temp left at %s", iRetry, szTempFile);
+        return PLUGIN_HANDLED;
+    }
+    rename_file(szTempFile, g_szCustomSkinsPath, 1);
+
+    if (target && is_user_connected(target))
+    {
+        LoadCustomSkinsForPlayer(target);
+        ApplyCurrentWeaponSkin(target);
+        if (is_user_alive(target))
+            cs_reset_user_model(target);
+        client_printcolor(target, "!g[FreeNova Skins] !nYour custom skin assignment was reset by Admin.");
+    }
+
+    console_print(id, "[FreeNova Skins] Removed %d custom assignment(s) for %s.", iRemoved, szAuth);
+    return PLUGIN_HANDLED;
+}
+
+public Cmd_AdminListSkins(id, level, cid)
+{
+    if (!cmd_access(id, level, cid, 1))
+        return PLUGIN_HANDLED;
+
+    if (!file_exists(g_szCustomSkinsPath))
+    {
+        console_print(id, "[FreeNova Skins] custom_skins.ini is empty or does not exist.");
+        return PLUGIN_HANDLED;
+    }
+
+    new fp = fopen(g_szCustomSkinsPath, "rt");
+    if (!fp) return PLUGIN_HANDLED;
+
+    console_print(id, "===================================================================");
+    console_print(id, "  FREENOVA CUSTOM SKIN ASSIGNMENTS (custom_skins.ini)");
+    console_print(id, "===================================================================");
+
+    new line[CONFIG_LINE_LEN], count = 0;
+    while (!feof(fp))
+    {
+        fgets(fp, line, charsmax(line));
+        trim(line);
+        if (!line[0] || line[0] == ';' || line[0] == '#') continue;
+
+        console_print(id, "  [%02d] %s", ++count, line);
+    }
+    fclose(fp);
+
+    console_print(id, "===================================================================");
+    console_print(id, "Total: %d assigned custom skin(s).", count);
+    return PLUGIN_HANDLED;
+}
+
+public Cmd_AdminSkinOrders(id, level, cid)
+{
+    if (!cmd_access(id, level, cid, 1))
+        return PLUGIN_HANDLED;
+
+    new szLogPath[128];
+    get_basedir(szLogPath, charsmax(szLogPath));
+    add(szLogPath, charsmax(szLogPath), "/addons/amxmodx/logs/custom_skins_orders.log");
+
+    if (!file_exists(szLogPath))
+    {
+        console_print(id, "[FreeNova Skins] No orders found in %s.", szLogPath);
+        return PLUGIN_HANDLED;
+    }
+
+    new fp = fopen(szLogPath, "rt");
+    if (!fp) return PLUGIN_HANDLED;
+
+    console_print(id, "===================================================================");
+    console_print(id, "  FREENOVA CUSTOM SKIN ORDERS (custom_skins_orders.log)");
+    console_print(id, "===================================================================");
+
+    new line[CONFIG_LINE_LEN], count = 0;
+    while (!feof(fp))
+    {
+        fgets(fp, line, charsmax(line));
+        trim(line);
+        if (!line[0]) continue;
+
+        console_print(id, "  %s", line);
+        count++;
+    }
+    fclose(fp);
+
+    console_print(id, "===================================================================");
+    console_print(id, "Total: %d order entries logged.", count);
+    return PLUGIN_HANDLED;
+}
+
+// ============================================================
+// HOOKS: CURWEAPON & PLAYER SPAWN
+// ============================================================
+
+public EventCurWeapon(id)
+{
+    if (!is_user_alive(id))
+        return;
+
+    ApplyCurrentWeaponSkin(id);
+}
+
+public Hook_PlayerSpawn(id)
+{
+    if (!is_user_alive(id))
+        return HAM_IGNORED;
+
+    remove_task(id + TASK_SPAWN_MODEL);
+    set_task(0.1, "TaskApplyPlayerModel", id + TASK_SPAWN_MODEL);
+    return HAM_IGNORED;
+}
+
+public TaskApplyPlayerModel(taskid)
+{
+    new id = taskid - TASK_SPAWN_MODEL;
+    ApplySpawnPlayerModel(id);
+}
+
+ApplySpawnPlayerModel(id)
+{
+    if (!is_user_alive(id))
+        return;
+
+    new CsTeams:team = cs_get_user_team(id);
+    if (team != CS_TEAM_T && team != CS_TEAM_CT)
+    {
+        cs_reset_user_model(id);
+        return;
+    }
+
+    // 1. Config forced model from player_models.ini (Highest Priority!)
+    if (g_szForcedPlayerModel[id][0])
+    {
+        new bool:bMatch = false;
+        if (g_iForcedPlayerTeam[id] == 0) bMatch = true;
+        else if (g_iForcedPlayerTeam[id] == 1 && team == CS_TEAM_T) bMatch = true;
+        else if (g_iForcedPlayerTeam[id] == 2 && team == CS_TEAM_CT) bMatch = true;
+
+        if (bMatch)
+        {
+            cs_set_user_model(id, g_szForcedPlayerModel[id]);
+            return;
+        }
+    }
+
+    // 1b. Custom exclusive model from custom_skins.ini
+    if (g_szCustomPlayerModel[id][0])
+    {
+        new bool:bMatch = false;
+        if (g_iCustomPlayerTeam[id] == 0) bMatch = true;
+        else if (g_iCustomPlayerTeam[id] == 1 && team == CS_TEAM_T) bMatch = true;
+        else if (g_iCustomPlayerTeam[id] == 2 && team == CS_TEAM_CT) bMatch = true;
+
+        if (bMatch)
+        {
+            cs_set_user_model(id, g_szCustomPlayerModel[id]);
+            return;
+        }
+    }
+
+    // 2. Independent T / CT equipped models (VIP-gated bodies fall off when VIP expires)
+    if (team == CS_TEAM_T && g_szEquipT[id][0])
+    {
+        if (PModelVipBlocked(id, g_szEquipT[id]))
+        {
+            g_szEquipT[id][0] = 0;
+            SavePlayerSkinsVault(id);
+        }
+        else
+        {
+            cs_set_user_model(id, g_szEquipT[id]);
+            return;
+        }
+    }
+    if (team == CS_TEAM_CT && g_szEquipCT[id][0])
+    {
+        if (PModelVipBlocked(id, g_szEquipCT[id]))
+        {
+            g_szEquipCT[id][0] = 0;
+            SavePlayerSkinsVault(id);
+        }
+        else
+        {
+            cs_set_user_model(id, g_szEquipCT[id]);
+            return;
+        }
+    }
+
+    // 3. Legend is owned via BP / shop and equipped from /models.
+    // Never auto-apply here - empty T/CT slots must stay default CS.
+
+    // 4. VIP / Admin models
+    if (LibraryExists("freenova_vip", LibType_Library))
+    {
+        if (get_user_flags(id) & ADMIN_BAN)
+        {
+            if (team == CS_TEAM_CT && file_exists("models/player/admin_ct/admin_ct.mdl"))
+            {
+                cs_set_user_model(id, "admin_ct");
+                return;
+            }
+            else if (team == CS_TEAM_T)
+            {
+                if (file_exists("models/player/admin_te/admin_te.mdl"))
+                {
+                    cs_set_user_model(id, "admin_te");
+                    return;
+                }
+                if (file_exists("models/player/admin_tero/admin_tero.mdl"))
+                {
+                    cs_set_user_model(id, "admin_tero");
+                    return;
+                }
+            }
+        }
+        else if (fnvip_get_tier(id) >= FNVIP_VIPPLUS) // VIP+ or VIP Elite
+        {
+            if (team == CS_TEAM_CT)
+            {
+                if (file_exists("models/player/vip_ct/vip_ct.mdl"))
+                {
+                    cs_set_user_model(id, "vip_ct");
+                    return;
+                }
+                if (file_exists("models/player/s1_vip_ct/s1_vip_ct.mdl"))
+                {
+                    cs_set_user_model(id, "s1_vip_ct");
+                    return;
+                }
+            }
+            else if (team == CS_TEAM_T)
+            {
+                if (file_exists("models/player/vip_tero/vip_tero.mdl"))
+                {
+                    cs_set_user_model(id, "vip_tero");
+                    return;
+                }
+                if (file_exists("models/player/s1_vip_t/s1_vip_t.mdl"))
+                {
+                    cs_set_user_model(id, "s1_vip_t");
+                    return;
+                }
+            }
+        }
+    }
+
+    // 5. Default CS model
+    cs_reset_user_model(id);
+}
+
+ApplyCurrentWeaponSkin(id)
+{
+    if (!is_user_alive(id))
+        return;
+
+    new weaponid = get_user_weapon(id);
+    new group = WeaponIdToGroup(weaponid);
+
+    if (group == -1)
+        return;
+
+    // 1. Owner-assigned custom skin takes absolute priority
+    if (g_szCustomWeaponV[id][group][0] && ModelPrecached(g_szCustomWeaponV[id][group]))
+    {
+        set_pev(id, pev_viewmodel2, g_szCustomWeaponV[id][group]);
+        if (g_szCustomWeaponP[id][group][0])
+            set_pev(id, pev_weaponmodel2, g_szCustomWeaponP[id][group]);
+        return;
+    }
+
+    // 2. Selected premade skin
+    new skin = g_SelectedSkin[id][group];
+
+    if (skin < 0 || skin >= g_SkinCount[group])
+    {
+        skin = 0;
+        g_SelectedSkin[id][group] = 0;
+    }
+
+    if (!CanUseSkin(id, group, skin))
+    {
+        skin = 0;
+        g_SelectedSkin[id][group] = 0;
+    }
+
+    if (g_ViewModels[group][skin][0])
+        set_pev(id, pev_viewmodel2, g_ViewModels[group][skin]);
+
+    if (g_PlayerModels[group][skin][0])
+        set_pev(id, pev_weaponmodel2, g_PlayerModels[group][skin]);
+}
+
+stock client_printcolor(id, const fmt[], any:...)
+{
+    new msg[192];
+    vformat(msg, charsmax(msg), fmt, 3);
+    replace_all(msg, charsmax(msg), "!g", "^4");
+    replace_all(msg, charsmax(msg), "!t", "^3");
+    replace_all(msg, charsmax(msg), "!n", "^1");
+    client_print_color(id, print_team_default, msg);
+}

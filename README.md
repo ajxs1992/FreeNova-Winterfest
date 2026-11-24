@@ -19,7 +19,8 @@ git clone https://github.com/ajxs1992/FreeNova-Winterfest.git
 | `plugins/configs/` | the `.ini` configuration the plugins read |
 | `references/plates/` | the owner's 14 panel mockups, native resolution, unmodified (`SOURCES.json` has their hashes) |
 | `references/dashboard/` | the dashboard plate at full size |
-| `docs/` | the contract, the 14-page spec, the master feature plan, the art rule, the Winterfest plugin docs |
+| `game-server/cstrike/addons/amxmodx/` | the same plugin sources in the layout the server expects, so the suite can boot |
+| `docs/` | the contract, the 14-page spec, the master feature plan, the art rule, the gate, the Winterfest plugin docs |
 
 ## The two rules everything hangs off
 
@@ -52,6 +53,17 @@ node test_harness.mjs               # the suite
 # needs the AMX Mod X compiler (amxxpc, 32-bit) and the Pawn includes in plugins/includes/
 amxxpc plugins/scripting/winterfest_core.sma
 ```
+
+## Tests
+
+```bash
+cd web-panel && node test_harness.mjs     # 344 passed / 26 failed at this commit
+```
+
+`docs/panel/GATE.md` lists every failure grouped by cause: which are the environment (the
+advent window before 1 December), which are layout, and which are real bugs (the battlepass
+claim answers 405; the buy path returns the wrong balance; three pages scale in CSS but not
+in JS). Nothing here is described as green that is not.
 
 ## Licence
 

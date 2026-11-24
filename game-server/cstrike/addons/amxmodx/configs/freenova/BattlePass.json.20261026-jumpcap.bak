@@ -1,0 +1,956 @@
+{
+  "motd_bp": "http://127.0.0.1:8080/battlepass",
+  "theme": "freenova_theme.css",
+  "private_ranks": [
+    "Unranked", "Silver I", "Silver II", "Silver III", "Silver IV", "Silver Elite",
+    "Silver Elite Master", "Gold Nova I", "Gold Nova II", "Gold Nova III", "Gold Nova Master",
+    "Master Guardian", "Master Guardian II", "Master Guardian Elite", "Distinguished Master Guardian",
+    "Legendary Eagle", "Legendary Eagle Master", "Supreme Master First Class", "Global Elite"
+  ],
+  "private_rank_xp": [0, 2816, 3730, 4207, 4698, 4999, 5622, 6492, 7416, 8376, 9348, 9999, 10894, 12013, 13088, 14187, 15495, 18006, 30000],
+  "vip_skin_tiers": {
+    "0": "Regular",
+    "1": "VIP",
+    "2": "VIP+",
+    "3": "VIP ELITE",
+    "4": "LEGEND (Level 52)"
+  },
+  "daily_missions": {
+    "kills": 15,
+    "headshots": 3,
+    "plants": 2,
+    "defuses": 1,
+    "wins": 2,
+    "reward_xp": 500,
+    "bounties": {
+      "streak": {
+        "target": 5,
+        "reward_coins": 150,
+        "desc": "5-kill streak in one life"
+      },
+      "damage": {
+        "target": 500,
+        "reward_coins": 100,
+        "desc": "Deal 500 damage"
+      },
+      "survive": {
+        "target": 3,
+        "reward_coins": 100,
+        "desc": "Survive 3 rounds"
+      }
+    }
+  },
+  "weekly_missions": {
+    "kills": 100,
+    "headshots": 25,
+    "plants": 10,
+    "wins": 15,
+    "reward_xp": 5000,
+    "reward_coins": 1000
+  },
+  "shop_skills": {
+    "multi_jump": {
+      "name": "Multi-Jump",
+      "icon": "\ud83d\udc5f",
+      "max_stage": 3,
+      "desc": "Leap multiple times mid-air to reach high ledges and evade fire",
+      "stages": [
+        {
+          "stage": 1,
+          "cost": 2500,
+          "name": "Double Jump",
+          "desc": "2 Jumps total (1 Ground + 1 Mid-Air)"
+        },
+        {
+          "stage": 2,
+          "cost": 5000,
+          "name": "Triple Jump",
+          "desc": "3 Jumps total (1 Ground + 2 Mid-Air)"
+        },
+        {
+          "stage": 3,
+          "cost": 10000,
+          "name": "Quad Jump",
+          "desc": "4 Jumps total (1 Ground + 3 Mid-Air - Acrobatic)"
+        }
+      ]
+    },
+    "spawn_hp": {
+      "name": "Spawn HP Boost",
+      "icon": "\u2764\ufe0f",
+      "max_stage": 3,
+      "desc": "Begin every round with enhanced vitality above standard 100 HP",
+      "stages": [
+        {
+          "stage": 1,
+          "cost": 2000,
+          "name": "Vitality I",
+          "desc": "+10 Max HP on spawn (110 HP)"
+        },
+        {
+          "stage": 2,
+          "cost": 4500,
+          "name": "Vitality II",
+          "desc": "+20 Max HP on spawn (120 HP)"
+        },
+        {
+          "stage": 3,
+          "cost": 8000,
+          "name": "Vitality III",
+          "desc": "+30 Max HP on spawn (130 HP Titan)"
+        }
+      ]
+    },
+    "spawn_armor": {
+      "name": "Spawn Armor Boost",
+      "icon": "\ud83d\udee1\ufe0f",
+      "max_stage": 3,
+      "desc": "Spawn automatically equipped with military body armor & helmet",
+      "stages": [
+        {
+          "stage": 1,
+          "cost": 1500,
+          "name": "Reinforced Kevlar",
+          "desc": "+25 Kevlar Armor on spawn"
+        },
+        {
+          "stage": 2,
+          "cost": 3500,
+          "name": "Assault Suit",
+          "desc": "+50 Kevlar & Helmet on spawn"
+        },
+        {
+          "stage": 3,
+          "cost": 6000,
+          "name": "Juggernaut Vest",
+          "desc": "+100 Kevlar & Helmet on spawn"
+        }
+      ]
+    },
+    "vampire": {
+      "name": "Vampire Lifesteal",
+      "icon": "\ud83e\ude78",
+      "max_stage": 3,
+      "desc": "Extract health directly from fallen opponents upon every frag",
+      "stages": [
+        {
+          "stage": 1,
+          "cost": 2500,
+          "name": "Blood Sip",
+          "desc": "+10 HP restored per kill"
+        },
+        {
+          "stage": 2,
+          "cost": 5000,
+          "name": "Blood Feast",
+          "desc": "+20 HP per kill (+30 HP on Headshot)"
+        },
+        {
+          "stage": 3,
+          "cost": 8500,
+          "name": "Vampiric Lord",
+          "desc": "+30 HP per kill (+45 HP on Headshot)"
+        }
+      ]
+    },
+    "nimble": {
+      "name": "Nimble Agility",
+      "icon": "\u26a1",
+      "max_stage": 3,
+      "desc": "Passive movement speed enhancement for faster rotations & flanking",
+      "stages": [
+        {
+          "stage": 1,
+          "cost": 1500,
+          "name": "Swiftness I",
+          "desc": "+5% Permanent Movement Speed"
+        },
+        {
+          "stage": 2,
+          "cost": 3500,
+          "name": "Swiftness II",
+          "desc": "+10% Permanent Movement Speed"
+        },
+        {
+          "stage": 3,
+          "cost": 6500,
+          "name": "Swiftness III",
+          "desc": "+15% Permanent Movement Speed"
+        }
+      ]
+    },
+    "featherfall": {
+      "name": "Featherfall",
+      "icon": "\ud83e\udeb6",
+      "max_stage": 3,
+      "desc": "Absorbs kinetic impact from severe heights and cliff drops",
+      "stages": [
+        {
+          "stage": 1,
+          "cost": 1000,
+          "name": "Cushion",
+          "desc": "35% Fall Damage Reduction"
+        },
+        {
+          "stage": 2,
+          "cost": 2500,
+          "name": "Shock Absorber",
+          "desc": "70% Fall Damage Reduction"
+        },
+        {
+          "stage": 3,
+          "cost": 5000,
+          "name": "Zero-G Boots",
+          "desc": "100% Fall Damage Immunity (0 Damage)"
+        }
+      ]
+    },
+    "healthnade": {
+      "name": "Healthnade",
+      "icon": "\ud83e\uddea",
+      "max_stage": 2,
+      "desc": "Transforms your smoke grenade into a high-potency restorative vapor",
+      "stages": [
+        {
+          "stage": 1,
+          "cost": 2500,
+          "name": "Medic Smoke",
+          "desc": "Smoke grenade heals +35 HP to all nearby allies"
+        },
+        {
+          "stage": 2,
+          "cost": 5000,
+          "name": "Nano Mist",
+          "desc": "Enhanced cloud heals +70 HP and repairs 35 Armor"
+        }
+      ]
+    },
+    "fast_sniper": {
+      "name": "Fast Sniper",
+      "icon": "\ud83c\udfaf",
+      "max_stage": 2,
+      "desc": "Accelerates bolt-action chambering and weapon draw speed on sniper rifles",
+      "stages": [
+        {
+          "stage": 1,
+          "cost": 2000,
+          "name": "Quick Bolt",
+          "desc": "15% faster bolt cycle & re-zoom on AWP/Scout"
+        },
+        {
+          "stage": 2,
+          "cost": 4500,
+          "name": "Master Marksman",
+          "desc": "30% faster bolt cycle & instant weapon switch"
+        }
+      ]
+    },
+    "revive": {
+      "name": "Combat Medic",
+      "icon": "\ud83d\udc89",
+      "max_stage": 2,
+      "desc": "Resurrect dead teammates right where they fell using the CPR defibrillator",
+      "stages": [
+        {
+          "stage": 1,
+          "cost": 3000,
+          "name": "Field Medic",
+          "desc": "Revive teammates within 3.0 seconds"
+        },
+        {
+          "stage": 2,
+          "cost": 6000,
+          "name": "Trauma Specialist",
+          "desc": "Rapid Revive within 1.5 seconds"
+        }
+      ]
+    },
+    "laststand": {
+      "name": "Last Stand",
+      "icon": "\ud83d\udee1\ufe0f",
+      "max_stage": 2,
+      "desc": "Emergency adrenaline surge defying death when taking fatal damage",
+      "stages": [
+        {
+          "stage": 1,
+          "cost": 3500,
+          "name": "Second Wind",
+          "desc": "Survive fatal hit with 1 HP once per round"
+        },
+        {
+          "stage": 2,
+          "cost": 7000,
+          "name": "Defiance",
+          "desc": "Survive fatal hit with 25 HP + 3s Speed Burst"
+        }
+      ]
+    },
+    "parachute": {
+      "name": "Tactical Parachute",
+      "icon": "\ud83e\ude82",
+      "max_stage": 1,
+      "desc": "Deployable canopy for precision gliding and silent high-ground flanking",
+      "stages": [
+        {
+          "stage": 1,
+          "cost": 1500,
+          "name": "Canopy Glider",
+          "desc": "Hold [USE / E] mid-air to glide safely to the ground"
+        }
+      ]
+    },
+    "awp_unlock": {
+      "name": "AWP Armory License",
+      "icon": "\ud83d\udd2b",
+      "max_stage": 1,
+      "desc": "Permanent security clearance allowing AWP purchase in the weapon armory",
+      "stages": [
+        {
+          "stage": 1,
+          "cost": 2000,
+          "name": "Sniper License",
+          "desc": "Permanent access to AWP in the weapon menu"
+        }
+      ]
+    },
+    "chat_color": {
+      "name": "Chat Color License",
+      "icon": "\ud83d\udcac",
+      "max_stage": 1,
+      "desc": "Permanent clearance to transmit custom colored chat text (Toxic Green & Team Color)",
+      "stages": [
+        {
+          "stage": 1,
+          "cost": 8000,
+          "name": "Color Transmitter",
+          "desc": "Permanent access to /color - unlock Toxic Green (^4) and Dynamic Team Color (^3)"
+        }
+      ]
+    }
+  },
+  "reward_track": {
+    "1": [
+      "100 Coins"
+    ],
+    "2": [
+      "50 Coins"
+    ],
+    "3": [
+      "150 Coins"
+    ],
+    "4": [
+      "50 Coins"
+    ],
+    "5": [
+      "250 Coins"
+    ],
+    "6": [
+      "100 Coins"
+    ],
+    "7": [
+      "50 Coins"
+    ],
+    "8": [
+      "100 Coins"
+    ],
+    "9": [
+      "50 Coins"
+    ],
+    "10": [
+      "500 Coins"
+    ],
+    "11": [
+      "100 Coins"
+    ],
+    "12": [
+      "50 Coins"
+    ],
+    "13": [
+      "100 Coins"
+    ],
+    "14": [
+      "50 Coins"
+    ],
+    "15": [
+      "750 Coins"
+    ],
+    "16": [
+      "100 Coins"
+    ],
+    "17": [
+      "50 Coins"
+    ],
+    "18": [
+      "250 Coins"
+    ],
+    "19": [
+      "100 Coins"
+    ],
+    "20": [
+      "50 Coins"
+    ],
+    "21": [
+      "500 Coins"
+    ],
+    "22": [
+      "100 Coins"
+    ],
+    "23": [
+      "50 Coins"
+    ],
+    "24": [
+      "100 Coins"
+    ],
+    "25": [
+      "1000 Coins"
+    ],
+    "26": [
+      "100 Coins"
+    ],
+    "27": [
+      "50 Coins"
+    ],
+    "28": [
+      "500 Coins"
+    ],
+    "29": [
+      "100 Coins"
+    ],
+    "30": [
+      "750 Coins"
+    ],
+    "31": [
+      "100 Coins"
+    ],
+    "32": [
+      "50 Coins"
+    ],
+    "33": [
+      "100 Coins"
+    ],
+    "34": [
+      "50 Coins"
+    ],
+    "35": [
+      "500 Coins"
+    ],
+    "36": [
+      "100 Coins"
+    ],
+    "37": [
+      "50 Coins"
+    ],
+    "38": [
+      "100 Coins"
+    ],
+    "39": [
+      "50 Coins"
+    ],
+    "40": [
+      "750 Coins"
+    ],
+    "41": [
+      "200 Coins"
+    ],
+    "42": [
+      "100 Coins"
+    ],
+    "43": [
+      "200 Coins"
+    ],
+    "44": [
+      "100 Coins"
+    ],
+    "45": [
+      "1000 Coins"
+    ],
+    "46": [
+      "200 Coins"
+    ],
+    "47": [
+      "100 Coins"
+    ],
+    "48": [
+      "200 Coins"
+    ],
+    "49": [
+      "100 Coins"
+    ],
+    "50": [
+      "2000 Coins",
+      "LEGENDARY MILESTONE"
+    ],
+    "51": [
+      "5000 Coins"
+    ],
+    "52": [
+      "10000 Coins",
+      "LEGEND PLAYER SKIN + WEAPON SKINS"
+    ]
+  },
+  "events": [
+    {
+      "id": "first_1000_kills",
+      "title": "Kill Race: First to 1,000 Kills",
+      "status": "LIVE",
+      "badge": "TOURNAMENT",
+      "start_time": "2026-09-08 00:00",
+      "end_time": "2026-09-15 23:59",
+      "target": "1,000 Kills",
+      "reward": "10,000 Coins + 7 Days VIP ELITE",
+      "description": "First player on the server to reach 1,000 kills during the event period takes home the grand prize!",
+      "leader": "GhostRider (642/1000)",
+      "leader_progress": 64
+    },
+    {
+      "id": "headshot_weekend",
+      "title": "Headshot Frenzy Weekend",
+      "status": "UPCOMING",
+      "badge": "WEEKEND EVENT",
+      "start_time": "2026-09-12 18:00",
+      "end_time": "2026-09-14 23:59",
+      "target": "200 Headshots",
+      "reward": "3,000 Coins + 1.5x XP Boost",
+      "description": "All headshots grant bonus coins. First 3 players to reach 200 headshots during the weekend win bonus loot crates!",
+      "leader": "Starts Friday 6:00 PM",
+      "leader_progress": 0
+    },
+    {
+      "id": "bomb_squad",
+      "title": "Operation Objective Master",
+      "status": "LIVE",
+      "badge": "COMMUNITY",
+      "start_time": "2026-09-07 00:00",
+      "end_time": "2026-09-14 00:00",
+      "target": "50 Plants / Defuses",
+      "reward": "5,000 Coins + Custom Chat Title",
+      "description": "Plant or defuse 50 C4 explosives in live matches. Teamplay and objective play rewarded!",
+      "leader": "CyberNinja (38/50)",
+      "leader_progress": 76
+    }
+  ],
+  "leaderboards": {
+    "top_coins": [
+      {
+        "rank": 1,
+        "name": "GhostRider",
+        "coins": 48250,
+        "vip": "VIP ELITE",
+        "level": 48,
+        "badge": "\ud83d\udc51 Champion"
+      },
+      {
+        "rank": 2,
+        "name": "CyberNinja",
+        "coins": 39100,
+        "vip": "VIP+",
+        "level": 42,
+        "badge": "\ud83e\udd48 Master"
+      },
+      {
+        "rank": 3,
+        "name": "Vortex_CS",
+        "coins": 31450,
+        "vip": "VIP",
+        "level": 37,
+        "badge": "\ud83e\udd49 Veteran"
+      },
+      {
+        "rank": 4,
+        "name": "ShadowSniper",
+        "coins": 26800,
+        "vip": "Regular",
+        "level": 34,
+        "badge": "Elite"
+      },
+      {
+        "rank": 5,
+        "name": "NightHawk",
+        "coins": 22300,
+        "vip": "VIP",
+        "level": 30,
+        "badge": "Elite"
+      },
+      {
+        "rank": 6,
+        "name": "ApexPredator",
+        "coins": 19500,
+        "vip": "VIP+",
+        "level": 27,
+        "badge": "Pro"
+      },
+      {
+        "rank": 7,
+        "name": "BulletStorm",
+        "coins": 16400,
+        "vip": "Regular",
+        "level": 24,
+        "badge": "Pro"
+      },
+      {
+        "rank": 8,
+        "name": "IronClad",
+        "coins": 14200,
+        "vip": "VIP",
+        "level": 21,
+        "badge": "Challenger"
+      },
+      {
+        "rank": 9,
+        "name": "Phantom",
+        "coins": 11950,
+        "vip": "Regular",
+        "level": 18,
+        "badge": "Challenger"
+      },
+      {
+        "rank": 10,
+        "name": "Blaze",
+        "coins": 9800,
+        "vip": "Regular",
+        "level": 15,
+        "badge": "Rising"
+      }
+    ],
+    "top_missions": [
+      {
+        "rank": 1,
+        "name": "CyberNinja",
+        "completed": 94,
+        "vip": "VIP+",
+        "streak": 14,
+        "badge": "\ud83d\udc51 Mission God"
+      },
+      {
+        "rank": 2,
+        "name": "GhostRider",
+        "completed": 88,
+        "vip": "VIP ELITE",
+        "streak": 12,
+        "badge": "\ud83e\udd48 Hardcore"
+      },
+      {
+        "rank": 3,
+        "name": "ShadowSniper",
+        "completed": 76,
+        "vip": "Regular",
+        "streak": 9,
+        "badge": "\ud83e\udd49 Dedicated"
+      },
+      {
+        "rank": 4,
+        "name": "Vortex_CS",
+        "completed": 69,
+        "vip": "VIP",
+        "streak": 8,
+        "badge": "Grinder"
+      },
+      {
+        "rank": 5,
+        "name": "NightHawk",
+        "completed": 61,
+        "vip": "VIP",
+        "streak": 7,
+        "badge": "Grinder"
+      },
+      {
+        "rank": 6,
+        "name": "ApexPredator",
+        "completed": 54,
+        "vip": "VIP+",
+        "streak": 5,
+        "badge": "Active"
+      },
+      {
+        "rank": 7,
+        "name": "IronClad",
+        "completed": 47,
+        "vip": "VIP",
+        "streak": 4,
+        "badge": "Active"
+      },
+      {
+        "rank": 8,
+        "name": "BulletStorm",
+        "completed": 41,
+        "vip": "Regular",
+        "streak": 3,
+        "badge": "Competitor"
+      },
+      {
+        "rank": 9,
+        "name": "Phantom",
+        "completed": 36,
+        "vip": "Regular",
+        "streak": 3,
+        "badge": "Competitor"
+      },
+      {
+        "rank": 10,
+        "name": "Blaze",
+        "completed": 30,
+        "vip": "Regular",
+        "streak": 2,
+        "badge": "Rookie"
+      }
+    ]
+  },
+  "cosmetics": {
+    "spawn_effects": {
+      "neon_ring": {
+        "name": "Neon Energy Ring",
+        "cost": 5000,
+        "badge": "UNCOMMON",
+        "desc": "Expanding emerald neon energy ring around your feet on spawn."
+      },
+      "fire_aura": {
+        "name": "Blazing Fire Aura",
+        "cost": 7500,
+        "badge": "RARE",
+        "desc": "Intense flame aura and fiery particles surrounding you on spawn."
+      },
+      "lightning_spark": {
+        "name": "Thunder Spark Halo",
+        "cost": 10000,
+        "badge": "EPIC",
+        "desc": "Electric discharge and bright sparks radiating upon spawning."
+      },
+      "shadow_void": {
+        "name": "Shadow Void Ring",
+        "cost": 12000,
+        "badge": "MYTHIC",
+        "desc": "Dark smoky dimensional void expanding from your position."
+      },
+      "divine_light": {
+        "name": "Divine Angelic Beacon",
+        "cost": 15000,
+        "badge": "LEGENDARY",
+        "desc": "Heavenly pillar of bright glowing light descending on your spawn."
+      }
+    },
+    "chat_titles": {
+      "title_godlike": {
+        "name": "[\u2605 GODLIKE]",
+        "cost": 3000,
+        "badge": "UNCOMMON",
+        "tag": "[\u2605 GODLIKE]",
+        "color": "#FBBF24",
+        "desc": "Golden celestial prefix before your name in all chat."
+      },
+      "title_phantom": {
+        "name": "[\u26a1 PHANTOM]",
+        "cost": 5000,
+        "badge": "RARE",
+        "tag": "[\u26a1 PHANTOM]",
+        "color": "#38BDF8",
+        "desc": "Electric cyan phantom prefix before your name in chat."
+      },
+      "title_warlord": {
+        "name": "[\ud83d\udd25 WARLORD]",
+        "cost": 7500,
+        "badge": "EPIC",
+        "tag": "[\ud83d\udd25 WARLORD]",
+        "color": "#EF4444",
+        "desc": "Fierce red warlord battle title preceding your chat messages."
+      },
+      "title_legend": {
+        "name": "[\ud83d\udc51 LEGEND]",
+        "cost": 10000,
+        "badge": "MYTHIC",
+        "tag": "[\ud83d\udc51 LEGEND]",
+        "color": "#EAB308",
+        "desc": "Regal golden crown title signifying server royalty."
+      },
+      "title_immortal": {
+        "name": "[\ud83d\udc80 IMMORTAL]",
+        "cost": 15000,
+        "badge": "LEGENDARY",
+        "tag": "[\ud83d\udc80 IMMORTAL]",
+        "color": "#A855F7",
+        "desc": "Mythical purple deathmaster title commanding maximum respect."
+      },
+      "title_global_elite": {
+        "name": "[ THE GLOBAL ELITE ]",
+        "cost": 20000,
+        "badge": "CS2 COVERT",
+        "tag": "[ THE GLOBAL ELITE ]",
+        "color": "#EB4B4B",
+        "desc": "Top of the competitive hierarchy. The legendary Global Elite title from Counter-Strike 2."
+      },
+      "title_premier_master": {
+        "name": "[ PREMIER MASTER ]",
+        "cost": 18000,
+        "badge": "CS2 PINK",
+        "tag": "[ PREMIER MASTER ]",
+        "color": "#D32CE6",
+        "desc": "CS2 Premier 20,000+ Rating champion title commanding respect in every match."
+      },
+      "title_supreme_master": {
+        "name": "[ SUPREME MASTER ]",
+        "cost": 15000,
+        "badge": "CS2 CLASSIFIED",
+        "tag": "[ SUPREME MASTER ]",
+        "color": "#D32CE6",
+        "desc": "Supreme Master First Class competitive veteran title."
+      },
+      "title_legendary_eagle": {
+        "name": "[ LEGENDARY EAGLE ]",
+        "cost": 12000,
+        "badge": "CS2 RESTRICTED",
+        "tag": "[ LEGENDARY EAGLE ]",
+        "color": "#8847FF",
+        "desc": "High-tier competitive eagle title demonstrating sharp tactical aim."
+      },
+      "title_clutch_god": {
+        "name": "[ CLUTCH GOD ]",
+        "cost": 14000,
+        "badge": "CS2 SPECIAL",
+        "tag": "[ CLUTCH GOD ]",
+        "color": "#F59E0B",
+        "desc": "Ice-cold 1vX clutch master title for round-winning anchors."
+      },
+      "title_major_mvp": {
+        "name": "[ MAJOR MVP ]",
+        "cost": 25000,
+        "badge": "CS2 CONTRABAND",
+        "tag": "[ MAJOR MVP ]",
+        "color": "#E4AE39",
+        "desc": "Crown of tournament legends. The official FreeNova CS2 Major MVP title."
+      },
+      "title_awp_deity": {
+        "name": "[ AWP DEITY ]",
+        "cost": 16000,
+        "badge": "CS2 SHARPSHOOTER",
+        "tag": "[ AWP DEITY ]",
+        "color": "#38BDF8",
+        "desc": "Unforgiving one-shot one-kill sniper deity title."
+      }
+    },
+    "death_effects": {
+      "death_lightning": {
+        "name": "Sky Lightning Bolt",
+        "cost": 6000,
+        "badge": "RARE",
+        "desc": "A thunderous lightning strike hits your victim's body upon kill."
+      },
+      "death_blood": {
+        "name": "Crimson Blood Burst",
+        "cost": 8000,
+        "badge": "EPIC",
+        "desc": "A violent blast of high-pressure blood erupts from the defeated enemy."
+      },
+      "death_frost": {
+        "name": "Glacial Frost Shatter",
+        "cost": 10000,
+        "badge": "MYTHIC",
+        "desc": "Victim's body turns to ice and violently shatters into crystal shards."
+      },
+      "death_skull": {
+        "name": "Ascending Skull Ghost",
+        "cost": 12000,
+        "badge": "LEGENDARY",
+        "desc": "A sinister skull spirit ascends from the corpse into the sky."
+      }
+    },
+    "chat_colors": {
+      "color_default": {
+        "name": "Classic Gold (^1)",
+        "cost": 0,
+        "badge": "DEFAULT",
+        "code": 0,
+        "hex": "#EAB308",
+        "desc": "Standard server golden yellow chat text."
+      },
+      "color_green": {
+        "name": "Toxic Cyber Green (^4)",
+        "cost": 8000,
+        "badge": "FREENOVA",
+        "code": 1,
+        "hex": "#74E600",
+        "desc": "Signature FreeNova radiant cyber green chat text. Requires Chat Color License skill."
+      },
+      "color_team": {
+        "name": "Dynamic Team Color (^3)",
+        "cost": 8000,
+        "badge": "DYNAMIC",
+        "code": 2,
+        "hex": "#38BDF8",
+        "desc": "Dynamic chat text matching your team color (Terrorist Crimson / CT Electric Cyan). Requires Chat Color License skill."
+      }
+    },
+    "custom_tags": {
+      "tag_slot": {
+        "name": "Custom In-Game Tag Slot",
+        "cost": 15000,
+        "badge": "PREMIUM",
+        "desc": "Permanent custom prefix slot shown before your name in all chat: [ YOUR TEXT ]. Use /tag <text> to set."
+      }
+    },
+    "premade_tags": {
+      "tag_freenova": {
+        "id": 1,
+        "name": "[ FreeNova ]",
+        "cost": 2500,
+        "badge": "BRAND",
+        "color": "#74e600",
+        "desc": "Official FreeNova server brand badge prefix."
+      },
+      "tag_pro": {
+        "id": 2,
+        "name": "[ PRO ]",
+        "cost": 3000,
+        "badge": "COMPETITIVE",
+        "color": "#38bdf8",
+        "desc": "Certified competitive pro shooter prefix."
+      },
+      "tag_beast": {
+        "id": 3,
+        "name": "[ BEAST ]",
+        "cost": 3000,
+        "badge": "WARRIOR",
+        "color": "#f97316",
+        "desc": "Fierce unstoppable fragger combat tag."
+      },
+      "tag_clutch": {
+        "id": 4,
+        "name": "[ CLUTCH ]",
+        "cost": 3500,
+        "badge": "TACTICAL",
+        "color": "#a855f7",
+        "desc": "Cold-blooded 1vX clutch round finisher."
+      },
+      "tag_ace": {
+        "id": 5,
+        "name": "[ ACE ]",
+        "cost": 3500,
+        "badge": "DEADLY",
+        "color": "#ef4444",
+        "desc": "Round-sweep 5-kill ace eliminator."
+      },
+      "tag_headshot": {
+        "id": 6,
+        "name": "[ HEADSHOT ]",
+        "cost": 4000,
+        "badge": "PRECISION",
+        "color": "#ffd700",
+        "desc": "Precision skull-piercing marksman prefix."
+      },
+      "tag_onetap": {
+        "id": 7,
+        "name": "[ ONE TAP ]",
+        "cost": 4000,
+        "badge": "SHARPSHOOTER",
+        "color": "#eab308",
+        "desc": "First-bullet lethal accuracy specialist."
+      },
+      "tag_vip": {
+        "id": 8,
+        "name": "[ VIP ]",
+        "cost": 5000,
+        "badge": "ELITE",
+        "color": "#84cc16",
+        "desc": "Distinguished VIP network status symbol."
+      }
+    }
+  }
+}
