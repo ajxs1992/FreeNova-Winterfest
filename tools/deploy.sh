@@ -21,7 +21,7 @@ DRY=${2:-}
 
 case "$TARGET" in
   plugins)
-    HOST=193.70.81.30; PORT=2022; USER_SFTP=cmux305a200lt01pppogfv4wj
+    HOST=${FREENOVA_HOST:?set FREENOVA_HOST}; PORT=${FREENOVA_PORT:-2022}; USER_SFTP=${FREENOVA_USER:?set FREENOVA_USER}
     PASS="$CFG/s1.pass"
     # local tree  ->  remote root (relative to the server's working dir)
     PAIRS=(
