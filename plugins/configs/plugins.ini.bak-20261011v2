@@ -1,0 +1,96 @@
+; AMX Mod X plugins
+
+; Admin Base - Always one has to be activated
+admin.amxx		; admin base (required for any admin-related)
+;admin_sql.amxx		; admin base - SQL version (comment admin.amxx)
+
+; Basic
+admincmd.amxx		; basic admin console commands (kick/slay/map; bans owned by advanced_bans)
+postgres_engine.amxx	; PostgreSQL engine for Advanced Bans (not SQLX)
+advanced_bans.amxx	; PostgreSQL SteamID+IP bans (owns amx_ban; CBan natives; not SQLX)
+cban_screenshots.amxx	; snapshots on ban via CBan_OnPlayerBannedPre
+bypass_guard.amxx	; VPN/ASN/IP connect gate
+;bg_provider_iphubclient.amxx	; IPHub lookup — no keys in iphub_api_keys.ini (RTE 1 every map)
+ab_bypass_bridge.amxx	; counts Advanced Bans hits per ASN, auto-blacklists
+adminhelp.amxx		; help command for admin console commands
+adminslots.amxx		; slot reservation
+multilingual.amxx	; Multi-Lingual management
+
+; Menus
+menufront.amxx		; front-end for admin menus
+cmdmenu.amxx		; command menu (speech, settings)
+plmenu.amxx		; players menu (kick, ban, client cmds.)
+;telemenu.amxx		; teleport menu (Fun Module required!)
+mapsmenu.amxx		; maps menu (vote, changelevel)
+pluginmenu.amxx		; Menus for commands/cvars organized by plugin
+
+; Chat / Messages
+adminchat.amxx		; console chat commands
+antiflood.amxx		; prevent clients from chat-flooding the server
+scrollmsg.amxx		; displays a scrolling message
+imessage.amxx		; displays information messages
+adminvote.amxx		; vote commands
+
+; Map related
+nextmap.amxx		; displays next map in mapcycle
+mapchooser.amxx		; allows to vote for next map
+timeleft.amxx		; displays time left on map
+
+; Configuration
+pausecfg.amxx		; allows to pause and unpause some plugins
+statscfg.amxx		; allows to manage stats plugins via menu and commands
+
+
+; Custom - Add 3rd party plugins here
+
+; ==========================================
+; FreeNova — one system. Rank engine is freenova_rank (was rsu_core).
+; Retired RSU copies live in scripting\archive\rsu_retired_20260924\
+; ==========================================
+freenova_rank.amxx          ; XP, level, rank, kills. File is rsu_core renamed. Do not load a second rank plugin.
+freenova_rank_api.amxx      ; crxranks_* for VIP, battle pass, HUD, team XP. Was rsu_crx_compat.
+freenova_vip.amxx
+battlepass_core.amxx        ; coins, shop, skills
+freenova_achievements.amxx
+freenova_missions.amxx
+freenova_prefs.amxx
+freenova_panel.amxx
+freenova_progression.amxx   ; happy hour, bot XP, playtime. Not a second rank.
+freenova_season.amxx
+freenova_teamxp.amxx        ; assist and objective XP through the rank API
+freenova_hud.amxx
+freenova_weaponstats.amxx
+freenova_hub.amxx
+weaponmenu.amxx
+weapon_models.amxx
+parachute.amxx
+freenova_competitive.amxx   ; separate points, not XP
+freenova_gag.amxx           ; gag backend for panel (MUST load before cosmetics)
+freenova_cosmetics.amxx
+freenova_clutch.amxx
+freenova_ads.amxx             ; ads rotator
+freenova_mapvote.amxx         ; RTV/nominate/extend
+freenova_roundmusic.amxx      ; round-end music + MVP fanfare (fanfare off by default)
+freenova_sync.amxx          ; web push: snapshots + action pickup (local panel 127.0.0.1:8080)
+
+; Retired (same job as something above, or a mode this server does not run):
+; rsu_matchstats rsu_stats rsu_top — profile and top already exist on the rank engine and hub
+; rsu_missions rsu_achievements rsu_happy_hour rsu_bot_kill_xp rsu_damage_xp rsu_time_rewards
+; freenova_registration freenova_calladmin — web panel is off (sync is ON: local push only)
+; rt_* revive_bridge simple_warmup — not the FreeNova core
+; crx_ranksystem multijump top15_styled vip_ajxs
+
+; fn_probe.amxx  -- DISABLED 2026-10-11 public-hosting hardening: throwaway probe;
+;   source kept only in scripting\freenova_FOSSIL_DO_NOT_COMPILE_20260916 (do not compile).
+;   Previously loaded with the per-plugin log flag enabled.
+
+; ---- FreeNova: VIP custom sniper (flag t gate) -- DISABLED for public hosting 2026-10-11 ----
+; freenova_zgun.amxx  -- DISABLED 2026-10-11: registers ADMIN_BAN commands (amx_zgun*);
+;   re-enable only together with a real SteamID admin entry, never a name/tag grant.
+;   Side effect while disabled: VIPs do not receive the ZG-7.
+; zgun_selftest.amxx  -- DISABLED 2026-10-11: THROWAWAY test driver; injects ADMIN_BAN
+;   into a live player via set_user_flags (324 ZGTEST log lines, L20261008-10 logs).
+;   Never load in production.
+
+; Country Welcome - colored GeoIP welcome on join (cw_* cvars, amx_welcome_test)
+country_welcome.amxx		; greets players with their GeoIP country in chat

@@ -1,0 +1,2330 @@
+#include <amxmodx>
+#include <nvault>
+#include <amxmisc>
+#include <sockets>
+#include <sqlx>
+#include <geoip>
+#include <json>
+#include <cstrike>
+#include <crxranks>
+#include <menabp>
+#include <freenova_vip>
+#include <freenova_panelstats>
+#include <freenova_comp>
+#include <freenova_cosmetics>
+#include <freenova_models>
+#include <freenova_wpn>
+#include <ranksultimate>
+#include <freenova_web>
+#include <freenova_missions>
+
+#pragma dynamic 65536
+
+// FreeNova Web Sync v2.0 - Non-blocking real-data sync & web action execution.
+//
+// Features:
+//   - Completely non-blocking socket transport (SOCK_NON_BLOCKING + async poll).
+//   - Full progression, combat, competitive, cosmetic, skin, and model payload.
+//   - Action execution channel: parses actions from web panel and executes them.
+//   - Closed-loop action results reported back to Cloudflare Worker & D1.
+
+#define PLUGIN  "FreeNova Web Sync"
+#define VERSION "2.0"
+#define AUTHOR  "FreeNova"
+
+#define TASK_PUSH 32100
+#define TASK_POLL 32200
+#define TASK_EVT_LATEPAY 32300
+
+#define FCMSN_KILLS  0
+#define FCMSN_HS     1
+#define FCMSN_WINS   2
+#define FCMSN_MVP    3
+
+#define MAX_QUEUED_ACTIONS 16
+
+new g_pEnabled
+new g_pHost
+new g_pPort
+new g_pPath
+new g_pSecret
+new g_pInterval
+new g_pServerId
+new g_pUrl
+new g_pVHost
+new g_pEventXp
+new g_pEventCoins
+new g_pHostname
+new g_pHappyHour
+new g_pDoubleXp
+new g_iStartTime
+new g_VaultEvt
+// ---- offline settlement ledger (auto-created SQLite data/freenova_events.db) ----
+new Handle:g_EvtDb = Empty_Handle
+#define EVT_MAX_SPECS 8
+#define EVT_MAX_REPORTS 4
+#define EVT_MAX_WINNERS 8
+new g_EvtId[EVT_MAX_SPECS]
+new g_EvtMetric[EVT_MAX_SPECS][16]
+new g_EvtTarget[EVT_MAX_SPECS]
+new g_EvtScope[EVT_MAX_SPECS]
+new g_EvtMin[EVT_MAX_SPECS]
+new g_EvtCoins[EVT_MAX_SPECS]
+new g_EvtVt[EVT_MAX_SPECS]
+new g_EvtVd[EVT_MAX_SPECS]
+new g_EvtStart[EVT_MAX_SPECS]
+new g_EvtEnd[EVT_MAX_SPECS]
+new g_EvtCount
+// pending game-finalized reports for the next pushes (memory only; the panel
+// converges without them via its own settlement + nVault already-paid marks)
+new g_RepEid[EVT_MAX_REPORTS]
+new g_RepCount[EVT_MAX_REPORTS]
+new g_RepN[EVT_MAX_REPORTS]
+new g_RepAuth[EVT_MAX_REPORTS][EVT_MAX_WINNERS][40]
+new g_RepScore[EVT_MAX_REPORTS][EVT_MAX_WINNERS]
+new g_RepPaid[EVT_MAX_REPORTS][EVT_MAX_WINNERS]
+
+new g_iFailStreak
+
+// One immutable request at a time. Positive descriptors may still be connecting.
+#define SYNC_HEADER 1
+#define SYNC_BODY 2
+#define SYNC_RECEIVE 3
+new g_iActiveSocket
+new g_iTransportState
+new g_iSendOffset
+new g_iHeaderLength
+new g_iBodyLength
+new g_iResponseLength
+new g_iSentResultCount
+new bool:g_bPushAgain
+new Float:g_fSyncDeadline
+new szHeader[768]
+new szBody[16384]
+new g_szRespBuf[8192]
+
+// Action result buffer for closed-loop confirmation
+new g_iActionResultCount
+new g_iActionResultId[MAX_QUEUED_ACTIONS]
+new bool:g_bActionResultOk[MAX_QUEUED_ACTIONS]
+new g_szActionResultMsg[MAX_QUEUED_ACTIONS][64]
+
+new const g_szWeaponGroupKeys[][] = {
+    "ak47",
+    "m4a1",
+    "deagle",
+    "awp",
+    "knife"
+}
+
+new const g_szSkillIds[SKILL_COUNT][] = {
+    "multi_jump",
+    "spawn_hp",
+    "spawn_armor",
+    "vampire",
+    "nimble",
+    "featherfall",
+    "healthnade",
+    "fast_sniper",
+    "revive",
+    "laststand",
+    "parachute",
+    "awp_unlock",
+    "chat_color"
+}
+
+new const g_iSkillMaxStage[SKILL_COUNT] = {
+    3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1
+}
+
+// Keep in sync with battlepass_core.sma g_iSkillStageCosts.
+new const g_iSkillCosts[SKILL_COUNT][3] = {
+    { 2500, 5000, 10000 },
+    { 2000, 4500, 8000 },
+    { 1500, 3500, 6000 },
+    { 2500, 5000, 8500 },
+    { 1500, 3500, 6500 },
+    { 1000, 2500, 5000 },
+    { 2500, 5000, 0 },
+    { 2000, 4500, 0 },
+    { 3000, 6000, 0 },
+    { 3500, 7000, 0 },
+    { 1500, 0, 0 },
+    { 2000, 0, 0 },
+    { 8000, 0, 0 }
+}
+
+stock FindSkillById(const szId[])
+{
+    if (isdigit(szId[0]))
+    {
+        new num = str_to_num(szId)
+        if (num >= 0 && num < SKILL_COUNT) return num
+    }
+    for (new i = 0; i < SKILL_COUNT; i++)
+    {
+        if (equali(szId, g_szSkillIds[i]))
+            return i
+    }
+    return -1
+}
+
+public plugin_natives()
+{
+    set_native_filter("SyncNativeFilter")
+}
+
+public SyncNativeFilter(const name[], index, trap)
+{
+    if (equal(name, "fnmsn_claim")
+        || equal(name, "fnmsn_reroll")
+        || equal(name, "fnmsn_claim_all")
+        || equal(name, "fnmsn_get_rerolls_left")
+        || equal(name, "fnmsn_get_status")
+        || equal(name, "fnmsn_get_target")
+        || equal(name, "fnmsn_get_vip_progress"))
+        return PLUGIN_HANDLED
+    return PLUGIN_CONTINUE
+}
+
+public plugin_init()
+{
+    register_plugin(PLUGIN, VERSION, AUTHOR)
+
+    g_pEnabled  = register_cvar("fnweb_enabled", "1")
+    // Sync socket: HLDS → local panel is gone: numeric connect target (SyncNumericHost); Host header via fnweb_vhost. MOTD must NOT use this.
+    g_pHost     = register_cvar("fnweb_host", "127.0.0.1")
+    g_pPort     = register_cvar("fnweb_port", "8080")
+    g_pPath     = register_cvar("fnweb_path", "/api/v1/server/stats")
+    g_pSecret   = register_cvar("fnweb_secret", "")
+    g_pInterval = register_cvar("fnweb_interval", "30")
+    g_pServerId = register_cvar("fnweb_server_id", "freenova-public-1")
+    // Default is loopback (server-local). Client MOTD rewrites via fnweb_public_host.
+    g_pUrl      = register_cvar("fnweb_url", "http://127.0.0.1:8080")
+    register_cvar("fnweb_public_host", "") // LAN IP of the panel; empty = refuse MOTD
+    // Host header override for CDN/Worker routing. Connect target stays fnweb_host (numeric).
+    g_pVHost = register_cvar("fnweb_vhost", "")
+    register_cvar("fnweb_debug", "0")
+    // Event multipliers owned here so battlepass_core can resolve them in plugin_cfg.
+    g_pEventXp    = register_cvar("fn_event_xp_mult", "1.0")
+    g_pEventCoins = register_cvar("fn_event_coins_mult", "1.0")
+    g_VaultEvt = nvault_open("freenova_events")
+    if (g_VaultEvt <= 0)
+        log_amx("[FreeNova] WARNING: nvault_open freenova_events failed - event rewards disabled until reload")
+    g_iStartTime  = get_systime()
+    if (g_pUrl) {} // registered for in-game web MOTD bridge (freenova_web.inc)
+
+    register_srvcmd("fnweb_push_now", "Cmd_PushNow")
+}
+
+EvDbInit()
+{
+    SQL_SetAffinity("sqlite")
+    g_EvtDb = SQL_MakeDbTuple("localhost", "", "", "freenova_events")
+    if (g_EvtDb == Empty_Handle)
+    {
+        log_amx("[FreeNova EvLedger] SQLite tuple unavailable - offline settlement disabled")
+        return
+    }
+    new szQ[512]
+    formatex(szQ, charsmax(szQ), "CREATE TABLE IF NOT EXISTS ev_spec (event_id INTEGER PRIMARY KEY, metric TEXT, target INTEGER, scope INTEGER, min_score INTEGER, coins INTEGER, vtier INTEGER, vdays INTEGER, start_at INTEGER, end_at INTEGER, updated_at INTEGER)")
+    SQL_ThreadQuery(g_EvtDb, "HandleEvDbNop", szQ)
+    formatex(szQ, charsmax(szQ), "CREATE TABLE IF NOT EXISTS ev_base (event_id INTEGER, auth TEXT, metric TEXT, baseline INTEGER, taken_at INTEGER, PRIMARY KEY (event_id, auth, metric))")
+    SQL_ThreadQuery(g_EvtDb, "HandleEvDbNop", szQ)
+    formatex(szQ, charsmax(szQ), "CREATE TABLE IF NOT EXISTS ev_seen (auth TEXT, metric TEXT, current INTEGER, updated_at INTEGER, PRIMARY KEY (auth, metric))")
+    SQL_ThreadQuery(g_EvtDb, "HandleEvDbNop", szQ)
+    formatex(szQ, charsmax(szQ), "CREATE TABLE IF NOT EXISTS ev_win (event_id INTEGER, placement INTEGER, auth TEXT, score INTEGER, paid INTEGER, reported INTEGER, issued_at INTEGER, PRIMARY KEY (event_id, placement))")
+    SQL_ThreadQuery(g_EvtDb, "HandleEvDbNop", szQ)
+    // Local stats mirror: read-only cache of live values for FTP inspection.
+    // Authority stays where it was (rank/XP/vip/coins live systems + panel).
+    // Nothing in the game reads these rows back.
+    formatex(szQ, charsmax(szQ), "CREATE TABLE IF NOT EXISTS cache_players (steamid TEXT PRIMARY KEY, name TEXT, xp INTEGER, level INTEGER, rank_id INTEGER, prestige INTEGER, kills INTEGER, deaths INTEGER, headshots INTEGER, wins INTEGER, mvps INTEGER, coins INTEGER, vip_tier INTEGER, playtime_min INTEGER, updated_at INTEGER)")
+    SQL_ThreadQuery(g_EvtDb, "HandleEvDbNop", szQ)
+    formatex(szQ, charsmax(szQ), "CREATE TABLE IF NOT EXISTS cache_weapons (steamid TEXT, slot INTEGER, kills INTEGER, hs INTEGER, damage INTEGER, PRIMARY KEY (steamid, slot))")
+    SQL_ThreadQuery(g_EvtDb, "HandleEvDbNop", szQ)
+    log_amx("[FreeNova EvLedger] ledger ready (data/freenova_events.db)")
+}
+
+public HandleEvDbNop(failstate, Handle:query, error[], errnum, data[], size)
+{
+    if (failstate != TQUERY_SUCCESS)
+        log_amx("[FreeNova EvLedger] db op failed: %s", error)
+    return PLUGIN_HANDLED
+}
+
+public plugin_cfg()
+{
+    g_pHostname  = get_cvar_pointer("hostname")
+    g_pHappyHour = get_cvar_pointer("fn_happy_hour")
+    g_pDoubleXp  = get_cvar_pointer("fn_double_xp")
+    // amxx.cfg may still be applying on the first map — check after a beat.
+    set_task(2.0, "Task_CheckSecret")
+    EvDbInit()
+    set_task(60.0, "Task_EvtLedger", 0, "", 0, "b")
+    set_task(float(get_pcvar_num(g_pInterval)), "Task_Push", TASK_PUSH, "", 0, "b")
+}
+
+public Task_CheckSecret()
+{
+    new szSecret[8]
+    get_pcvar_string(g_pSecret, szSecret, charsmax(szSecret))
+    if (!szSecret[0])
+        log_amx("[FreeNova Web Sync] WARNING: fnweb_secret is empty — pushes will be rejected by the panel. Set it in amxx.cfg.")
+}
+
+public plugin_end()
+{
+    remove_task(TASK_PUSH)
+    remove_task(TASK_PUSH + 1)
+    remove_task(TASK_POLL)
+    if (g_iActiveSocket > 0)
+    {
+        socket_close(g_iActiveSocket)
+        g_iActiveSocket = 0
+    }
+    if (g_VaultEvt > 0)
+    {
+        nvault_close(g_VaultEvt)
+        g_VaultEvt = 0
+    }
+}
+
+public Cmd_PushNow()
+{
+    BuildAndPush()
+}
+
+public Task_Push()
+{
+    BuildAndPush()
+}
+
+CalculateRatingX100(id)
+{
+    new iKills = fnstats_get(id, FNSTAT_KILLS)
+    new iDeaths = fnstats_get(id, FNSTAT_DEATHS)
+    new iHs = fnstats_get(id, FNSTAT_HEADSHOTS)
+
+    if (iDeaths < 1)
+        iDeaths = 1
+
+    new iRating = (iKills * 100 + iHs * 20) / iDeaths
+    if (iRating < 50) iRating = 50
+    return iRating
+}
+
+BuildAndPush()
+{
+    if (!get_pcvar_num(g_pEnabled))
+        return
+
+    if (g_iActiveSocket > 0)
+    {
+        g_bPushAgain = true
+        return
+    }
+    remove_task(TASK_PUSH + 1)
+
+    new szSecret[96]
+    get_pcvar_string(g_pSecret, szSecret, charsmax(szSecret))
+    if (!szSecret[0])
+        return
+
+    new iPlayers[MAX_PLAYERS], iNum
+    get_players(iPlayers, iNum, "ch")
+    static szPlayer[4096]
+    new iIncluded = 0
+    new szEsc[64], szAuth[40], szTag[48], szModel[32]
+
+    formatex(szBody, charsmax(szBody), "{^"players^":[")
+
+    for (new i; i < iNum; i++)
+    {
+        new id = iPlayers[i]
+        if (!crxranks_is_user_loaded(id))
+            continue
+
+        // menabp gate: with battlepass_core absent or this player's BP data
+        // still loading, every menabp_* read below fails closed to 0 instead
+        // of aborting the whole push (and its action ACKs) on a missing
+        // / not-ready native call.
+        new bool:bBp = MenabpUsable(id)
+
+        new szName[32]
+        get_user_name(id, szName, charsmax(szName))
+        EscapeJson(szName, szEsc, charsmax(szEsc))
+        copy(szAuth, charsmax(szAuth), GetSafeAuth(id))
+
+        // Skip pending/LAN/bot — never push steamid "PENDING" into D1.
+        if (!szAuth[0])
+            continue
+
+        // Country code for web flags (geoip needs the bare IP, no port).
+        // Empty when unresolvable — the panel renders no flag then.
+        new szIP[32], szCC[3]
+        szCC[0] = 0
+        get_user_ip(id, szIP, charsmax(szIP), 1)
+        if (szIP[0])
+        {
+            geoip_code2_ex(szIP, szCC)
+            for (new k = 0; szCC[k]; k++)
+            {
+                if (szCC[k] >= 'A' && szCC[k] <= 'Z') szCC[k] += 32
+            }
+            if (strlen(szCC) != 2 || szCC[0] < 'a' || szCC[0] > 'z' || szCC[1] < 'a' || szCC[1] > 'z') szCC[0] = 0
+        }
+
+        new iKills = rsu_get_user_kills(id)
+        new iDeaths = rsu_get_user_deaths(id)
+        new iAssists = rsu_get_user_assists(id)
+        new iHs = rsu_get_user_headshots(id)
+        new iDamage = rsu_get_user_damage(id)
+        new iShots = rsu_get_user_shots(id)
+        new iHits = rsu_get_user_hits(id)
+        new iMvps = rsu_get_user_mvp(id)
+        new iWins = rsu_get_user_rounds_won(id)
+        new iPlayMin = rsu_get_user_played_time(id) / 60
+        new iLosses = (iDeaths > iWins) ? (iDeaths - iWins) : 0
+
+        // Cosmetics & Models
+        szTag[0] = 0
+        if (LibraryExists("freenova_cosmetics", LibType_Library))
+            fncosmetics_get_tag(id, szTag, charsmax(szTag))
+        new szEscTag[64]
+        EscapeJson(szTag, szEscTag, charsmax(szEscTag))
+
+        szModel[0] = 0
+        if (LibraryExists("weapon_models", LibType_Library))
+            fn_models_get_equipped(id, szModel, charsmax(szModel))
+
+        // Core stats & Progression
+        new iVipRemaining = LibraryExists("freenova_vip", LibType_Library) ? fnvip_get_remaining(id) : 0
+        formatex(szPlayer, charsmax(szPlayer), "%s{^"steamid^":^"%s^",^"name^":^"%s^",^"xp^":%d,^"level^":%d,^"rank_id^":%d,^"prestige^":%d,^"kills^":%d,^"deaths^":%d,^"assists^":%d,^"headshots^":%d,^"damage^":%d,^"shots^":%d,^"hits^":%d,^"mvps^":%d,^"wins^":%d,^"losses^":%d,^"playtime_minutes^":%d,^"rating_x100^":%d,^"vip_tier^":%d,^"vip_remaining^":%d,^"coins^":%d,^"bp_xp^":%d,^"bp_tier^":%d", iIncluded ? "," : "", szAuth, szEsc, crxranks_get_user_xp(id), crxranks_get_user_level(id), ClampRank(crxranks_get_user_level(id)), rsu_get_prestige(id), iKills, iDeaths, iAssists, iHs, iDamage, iShots, iHits, iMvps, iWins, iLosses, iPlayMin, CalculateRatingX100(id), fnvip_get_tier(id), iVipRemaining, bBp ? menabp_get_coins(id) : 0, bBp ? menabp_get_xp(id) : 0, bBp ? menabp_get_tier(id) : 0)
+
+        // BattlePass daily missions
+        formatex(szPlayer[strlen(szPlayer)], charsmax(szPlayer) - strlen(szPlayer), ",^"bp_daily_kills^":%d,^"bp_daily_hs^":%d,^"bp_daily_plants^":%d,^"bp_daily_defuses^":%d,^"bp_daily_wins^":%d,^"bp_daily_streak^":%d,^"bp_daily_damage^":%d,^"bp_daily_survives^":%d,^"bp_daily_complete^":%d", bBp ? menabp_get_daily_progress(id, 0) : 0, bBp ? menabp_get_daily_progress(id, 1) : 0, bBp ? menabp_get_daily_progress(id, 2) : 0, bBp ? menabp_get_daily_progress(id, 3) : 0, bBp ? menabp_get_daily_progress(id, 4) : 0, bBp ? menabp_get_daily2_progress(id, 0) : 0, bBp ? menabp_get_daily2_progress(id, 1) : 0, bBp ? menabp_get_daily2_progress(id, 2) : 0, bBp ? menabp_is_mission_complete(id) : 0)
+
+        // BattlePass weekly missions
+        formatex(szPlayer[strlen(szPlayer)], charsmax(szPlayer) - strlen(szPlayer), ",^"bp_weekly_kills^":%d,^"bp_weekly_hs^":%d,^"bp_weekly_plants^":%d,^"bp_weekly_wins^":%d,^"bp_weekly_complete^":%d", bBp ? menabp_get_weekly_progress(id, 0) : 0, bBp ? menabp_get_weekly_progress(id, 1) : 0, bBp ? menabp_get_weekly_progress(id, 2) : 0, bBp ? menabp_get_weekly_progress(id, 3) : 0, (bBp ? menabp_get_weekly_done(id) : 0) >= 4 ? 1 : 0)
+        if (LibraryExists("freenova_missions", LibType_Library))
+        {
+            new iStD = fnmsn_get_status(id, 0, 0) + fnmsn_get_status(id, 0, 1) * 10 + fnmsn_get_status(id, 0, 2) * 100 + fnmsn_get_status(id, 0, 3) * 1000 + fnmsn_get_status(id, 0, 4) * 10000
+            new iStB = fnmsn_get_status(id, 1, 0) + fnmsn_get_status(id, 1, 1) * 10 + fnmsn_get_status(id, 1, 2) * 100
+            new iStW = fnmsn_get_status(id, 2, 0) + fnmsn_get_status(id, 2, 1) * 10 + fnmsn_get_status(id, 2, 2) * 100 + fnmsn_get_status(id, 2, 3) * 1000
+            formatex(szPlayer[strlen(szPlayer)], charsmax(szPlayer) - strlen(szPlayer), ",^"rerolls_left^":%d,^"msn_st_d^":%d,^"msn_st_b^":%d,^"msn_st_w^":%d,^"msn_st_v^":%d,^"msn_vip_p^":%d,^"msn_tg^":^"%d,%d,%d,%d,%d|%d,%d,%d|%d,%d,%d,%d|%d^"",
+                fnmsn_get_rerolls_left(id), iStD, iStB, iStW, fnmsn_get_status(id, 3, 0), fnmsn_get_vip_progress(id),
+                fnmsn_get_target(id, 0, 0), fnmsn_get_target(id, 0, 1), fnmsn_get_target(id, 0, 2), fnmsn_get_target(id, 0, 3), fnmsn_get_target(id, 0, 4),
+                fnmsn_get_target(id, 1, 0), fnmsn_get_target(id, 1, 1), fnmsn_get_target(id, 1, 2),
+                fnmsn_get_target(id, 2, 0), fnmsn_get_target(id, 2, 1), fnmsn_get_target(id, 2, 2), fnmsn_get_target(id, 2, 3),
+                fnmsn_get_target(id, 3, 0))
+        }
+
+        // Competitive stats
+        new szSeason[8]
+        format_time(szSeason, charsmax(szSeason), "%Y-%m")
+        formatex(szPlayer[strlen(szPlayer)], charsmax(szPlayer) - strlen(szPlayer), ",^"comp_season^":^"%s^",^"comp_points^":%d,^"comp_lifetime^":%d,^"comp_kills^":%d,^"comp_hs^":%d,^"comp_wins^":%d,^"comp_mvp^":%d,^"comp_msn_k^":%d,^"comp_msn_h^":%d,^"comp_msn_w^":%d,^"comp_msn_m^":%d,^"comp_msn_done^":%d", szSeason, fncomp_get_points(id), fncomp_get_lifetime(id), fncomp_get_kills(id), fncomp_get_headshots(id), fncomp_get_wins(id), fncomp_get_mvp(id), fncomp_get_mission_progress(id, FCMSN_KILLS), fncomp_get_mission_progress(id, FCMSN_HS), fncomp_get_mission_progress(id, FCMSN_WINS), fncomp_get_mission_progress(id, FCMSN_MVP), fncomp_get_mission_done(id))
+
+        // BattlePass lifetime achievements (bitfield + counters; web display only)
+        formatex(szPlayer[strlen(szPlayer)], charsmax(szPlayer) - strlen(szPlayer), ",^"ach_unlocked^":%d,^"ach_kills^":%d,^"ach_hs^":%d,^"ach_plants^":%d,^"ach_defuses^":%d,^"ach_wins^":%d,^"ach_revives^":%d,^"ach_streak^":%d", bBp ? menabp_get_ach_unlocked(id) : 0, bBp ? menabp_get_ach_stat(id, 0) : 0, bBp ? menabp_get_ach_stat(id, 1) : 0, bBp ? menabp_get_ach_stat(id, 2) : 0, bBp ? menabp_get_ach_stat(id, 3) : 0, bBp ? menabp_get_ach_stat(id, 4) : 0, bBp ? menabp_get_ach_stat(id, 5) : 0, bBp ? menabp_get_ach_stat(id, 6) : 0)
+
+        // Equipped cosmetics
+        formatex(szPlayer[strlen(szPlayer)], charsmax(szPlayer) - strlen(szPlayer), ",^"eq_spawn^":%d,^"eq_title^":%d,^"eq_death^":%d,^"eq_color^":%d,^"custom_tag^":^"%s^",^"eq_model^":^"%s^"", fncosmetics_get_spawn(id), fncosmetics_get_title(id), fncosmetics_get_death(id), fncosmetics_get_color(id), szEscTag, szModel)
+
+        // Weapon stats — all 23 fnwps slots (web/mastery authority: kills+HS+damage).
+        new iWpnLen = strlen(szPlayer)
+        iWpnLen += formatex(szPlayer[iWpnLen], charsmax(szPlayer) - iWpnLen, ",^"weapons^":[")
+        for (new iSlot = 0; iSlot < 23; iSlot++)
+        {
+            iWpnLen += formatex(szPlayer[iWpnLen], charsmax(szPlayer) - iWpnLen,
+                "%s{^"slot^":%d,^"kills^":%d,^"hs^":%d,^"damage^":%d}",
+                iSlot ? "," : "", iSlot,
+                fnwps_get_kills(id, iSlot), fnwps_get_headshots(id, iSlot), fnwps_get_damage(id, iSlot))
+        }
+        formatex(szPlayer[iWpnLen], charsmax(szPlayer) - iWpnLen, "]")
+
+        // Equipped skins
+        formatex(szPlayer[strlen(szPlayer)], charsmax(szPlayer) - strlen(szPlayer), ",^"skins^":[{^"grp^":^"ak47^",^"skin^":%d,^"equipped^":1},{^"grp^":^"m4a1^",^"skin^":%d,^"equipped^":1},{^"grp^":^"deagle^",^"skin^":%d,^"equipped^":1},{^"grp^":^"awp^",^"skin^":%d,^"equipped^":1},{^"grp^":^"knife^",^"skin^":%d,^"equipped^":1}]", fn_skins_get_equipped(id, 0), fn_skins_get_equipped(id, 1), fn_skins_get_equipped(id, 2), fn_skins_get_equipped(id, 3), fn_skins_get_equipped(id, 4))
+
+        // Models array
+        new iForced = fn_models_is_forced(id)
+        if (szModel[0])
+        {
+            formatex(szPlayer[strlen(szPlayer)], charsmax(szPlayer) - strlen(szPlayer), ",^"models^":[{^"model^":^"%s^",^"equipped^":1,^"forced^":%d}]", szModel, iForced)
+        }
+        else
+        {
+            formatex(szPlayer[strlen(szPlayer)], charsmax(szPlayer) - strlen(szPlayer), ",^"models^":[]")
+        }
+
+        // Combat skills
+        formatex(szPlayer[strlen(szPlayer)], charsmax(szPlayer) - strlen(szPlayer),
+            ",^"skills^":{^"multi_jump^":%d,^"spawn_hp^":%d,^"spawn_armor^":%d,^"vampire^":%d,^"nimble^":%d,^"featherfall^":%d,^"healthnade^":%d,^"fast_sniper^":%d,^"revive^":%d,^"laststand^":%d,^"parachute^":%d,^"awp_unlock^":%d,^"chat_color^":%d}",
+            bBp ? menabp_get_skill_stage(id, 0) : 0,
+            bBp ? menabp_get_skill_stage(id, 1) : 0,
+            bBp ? menabp_get_skill_stage(id, 2) : 0,
+            bBp ? menabp_get_skill_stage(id, 3) : 0,
+            bBp ? menabp_get_skill_stage(id, 4) : 0,
+            bBp ? menabp_get_skill_stage(id, 5) : 0,
+            bBp ? menabp_get_skill_stage(id, 6) : 0,
+            bBp ? menabp_get_skill_stage(id, 7) : 0,
+            bBp ? menabp_get_skill_stage(id, 8) : 0,
+            bBp ? menabp_get_skill_stage(id, 9) : 0,
+            bBp ? menabp_get_skill_stage(id, 10) : 0,
+            bBp ? menabp_get_skill_stage(id, 11) : 0,
+            bBp ? menabp_get_skill_stage(id, 12) : 0)
+
+        formatex(szPlayer[strlen(szPlayer)], charsmax(szPlayer) - strlen(szPlayer),
+            ",^"bp_boosts^":{^"hp^":%d,^"armor^":%d,^"jumps^":%d,^"sniper^":%d,^"laststand^":%d,^"chute^":%d,^"premium^":%d,^"milestone^":%d},^"cc^":^"%s^"}",
+            bBp ? menabp_get_bp_hp(id) : 0,
+            bBp ? menabp_get_bp_armor(id) : 0,
+            bBp ? menabp_get_bp_jumps(id) : 0,
+            bBp ? menabp_get_bp_sniper(id) : 0,
+            bBp ? menabp_get_bp_laststand(id) : 0,
+            bBp ? menabp_get_bp_chute(id) : 0,
+            bBp ? menabp_get_bp_premium(id) : 0,
+            bBp ? menabp_get_bp_milestone(id) : 0,
+            szCC)
+
+        // ponytail: leave ~2KiB for action_results + closers; skip extras rather than truncate JSON
+        if (strlen(szBody) + strlen(szPlayer) + 2200 >= charsmax(szBody))
+        {
+            log_amx("[FreeNova Web Sync] 16KiB cap — omit remaining players after %d.", iIncluded)
+            break
+        }
+        if (g_EvtCount > 0)
+            EvCacheSeen(id)
+        add(szBody, charsmax(szBody), szPlayer)
+        iIncluded++
+    }
+
+    add(szBody, charsmax(szBody), "]")
+
+    // Snapshot the ACK prefix; retire it only after a validated success response.
+    g_iSentResultCount = g_iActionResultCount
+    new bool:bHasResults = bool:(g_iActionResultCount > 0)
+    if (bHasResults)
+    {
+        add(szBody, charsmax(szBody), ",^"action_results^":[")
+        for (new r; r < g_iActionResultCount; r++)
+        {
+            new szResultEntry[128]
+            formatex(szResultEntry, charsmax(szResultEntry), "%s{^"id^":%d,^"ok^":%s,^"result^":^"%s^"}", r ? "," : "", g_iActionResultId[r], g_bActionResultOk[r] ? "true" : "false", g_szActionResultMsg[r])
+            add(szBody, charsmax(szBody), szResultEntry)
+        }
+        add(szBody, charsmax(szBody), "]")
+    }
+
+    // Compact server envelope for staff overview. Skip rather than truncate.
+    new szMap[32], szHostname[64], szEscHost[80]
+    get_mapname(szMap, charsmax(szMap))
+    if (g_pHostname)
+        get_pcvar_string(g_pHostname, szHostname, charsmax(szHostname))
+    else
+        copy(szHostname, charsmax(szHostname), "FreeNova")
+    EscapeJson(szHostname, szEscHost, charsmax(szEscHost))
+
+    new iHumans, iSlots, iDummy[MAX_PLAYERS]
+    get_players(iDummy, iHumans, "ch")
+    iSlots = get_maxplayers()
+    new iUptime = (g_iStartTime > 0) ? (get_systime() - g_iStartTime) : 0
+    new Float:fHH = (g_pHappyHour) ? get_pcvar_float(g_pHappyHour) : 1.0
+    new Float:fEvXp    = (g_pEventXp)    ? get_pcvar_float(g_pEventXp)    : 1.0
+    new Float:fEvCoins = (g_pEventCoins) ? get_pcvar_float(g_pEventCoins) : 1.0
+
+    new szEnvelope[360]
+    formatex(szEnvelope, charsmax(szEnvelope),
+        ",^"server^":{^"map^":^"%s^",^"hostname^":^"%s^",^"players^":%d,^"humans^":%d,^"maxplayers^":%d,^"uptime^":%d,^"round^":0,^"hh^":%.2f,^"event_xp^":%.2f,^"event_coins^":%.2f,^"online^":1}",
+        szMap, szEscHost, iNum, iHumans, iSlots, iUptime, fHH, fEvXp, fEvCoins)
+    if (strlen(szBody) + strlen(szEnvelope) + 2 < charsmax(szBody))
+        add(szBody, charsmax(szBody), szEnvelope)
+
+    EvAppendReports()
+    add(szBody, charsmax(szBody), "}")
+
+    // Envelope-only heartbeat is intentional (empty server still reports map/hh).
+
+    if (strlen(szBody) >= charsmax(szBody))
+    {
+        log_amx("[FreeNova Web Sync] snapshot truncated at 16KiB — skip push.")
+        return
+    }
+
+    new szHost[64], szPath[128], szServerId[48]
+    get_pcvar_string(g_pHost, szHost, charsmax(szHost))
+    get_pcvar_string(g_pPath, szPath, charsmax(szPath))
+    get_pcvar_string(g_pServerId, szServerId, charsmax(szServerId))
+
+    // Host header may differ from the connect target (CDN/Worker routes on hostname,
+    // bare-IP Host is rejected). Empty fnweb_vhost = Host falls back to fnweb_host.
+    new szVHost[80]
+    get_pcvar_string(g_pVHost, szVHost, charsmax(szVHost))
+    if (!szVHost[0])
+        copy(szVHost, charsmax(szVHost), szHost)
+
+    new iErr = 0
+    // socket_open resolves names synchronously even with SOCK_NON_BLOCKING.
+    if (!SyncNumericHost(szHost))
+    {
+        log_amx("[FreeNova Web Sync] fnweb_host must be a numeric IPv4 address (use loopback).")
+        return
+    }
+    // Generic error 3 can accompany a valid pending descriptor. Readiness and
+    // I/O, not iErr alone, decide its fate; the deadline bounds all phases.
+    new iSocket = socket_open(szHost, get_pcvar_num(g_pPort), SOCKET_TCP, iErr, SOCK_NON_BLOCKING)
+    if (iSocket <= 0)
+    {
+        // One honest line on the 3rd consecutive failure, then silence until
+        // recovery. A dead panel must not flood the log every 30 seconds.
+        g_iFailStreak = min(g_iFailStreak + 1, 5)
+        if (g_iFailStreak == 3)
+            log_amx("[FreeNova Web Sync] Can't reach the web panel (%s:%d err=%d) - will retry quietly.", szHost, get_pcvar_num(g_pPort), iErr)
+        return
+    }
+
+    new szTimestamp[16], szNonce[32]
+    formatex(szTimestamp, charsmax(szTimestamp), "%d", time())
+    formatex(szNonce, charsmax(szNonce), "%d_%d", time(), random_num(100000, 999999))
+
+    // Sign hex(sha256(body)), not raw body — AMXX cannot fit a 16k body in a 2k buffer.
+    new szBodyHash[65]
+    hash_string(szBody, Hash_Sha256, szBodyHash, charsmax(szBodyHash))
+    new szSigInput[512]
+    formatex(szSigInput, charsmax(szSigInput), "%s:POST:%s:%s:%s:%s", szSecret, szPath, szTimestamp, szNonce, szBodyHash)
+
+    new szSigHex[65]
+    hash_string(szSigInput, Hash_Sha256, szSigHex, charsmax(szSigHex))
+
+    new iHdr
+    iHdr = formatex(szHeader, charsmax(szHeader), "POST %s HTTP/1.0^r^nHost: %s:%d^r^nContent-Type: application/json^r^n", szPath, szVHost, get_pcvar_num(g_pPort))
+    iHdr += formatex(szHeader[iHdr], charsmax(szHeader) - iHdr, "X-FreeNova-Server-ID: %s^r^nX-FreeNova-Timestamp: %s^r^n", szServerId, szTimestamp)
+    iHdr += formatex(szHeader[iHdr], charsmax(szHeader) - iHdr, "X-FreeNova-Nonce: %s^r^nX-FreeNova-Signature: %s^r^n", szNonce, szSigHex)
+    iHdr += formatex(szHeader[iHdr], charsmax(szHeader) - iHdr, "Content-Length: %d^r^nConnection: close^r^n^r^n", strlen(szBody))
+
+    // Retain both strings until completion. No send before writable polling.
+    g_iActiveSocket = iSocket
+    g_iTransportState = SYNC_HEADER
+    g_iSendOffset = 0
+    g_iHeaderLength = strlen(szHeader)
+    g_iBodyLength = strlen(szBody)
+    g_iResponseLength = 0
+    g_szRespBuf[0] = 0
+    g_fSyncDeadline = get_gametime() + 15.0
+    set_task(0.1, "Task_PollResponse", TASK_POLL, "", 0, "b")
+}
+
+public Task_PollResponse()
+{
+    if (g_iActiveSocket <= 0)
+    {
+        remove_task(TASK_POLL)
+        return
+    }
+
+    if (get_gametime() >= g_fSyncDeadline)
+    {
+        FinishPush(false)
+        return
+    }
+
+    if (g_iTransportState != SYNC_RECEIVE)
+    {
+        if (!socket_is_writable(g_iActiveSocket, 0))
+            return
+
+        new iSent
+        // socket_send ignores its length argument upstream. These are complete,
+        // NUL-terminated suffixes, so a short write cannot send a later segment.
+        if (g_iTransportState == SYNC_HEADER)
+            iSent = socket_send(g_iActiveSocket, szHeader[g_iSendOffset], g_iHeaderLength - g_iSendOffset)
+        else
+            iSent = socket_send(g_iActiveSocket, szBody[g_iSendOffset], g_iBodyLength - g_iSendOffset)
+
+        // The native does not expose errno: retain on -1/zero (including EAGAIN)
+        // and let the absolute deadline bound both transient and fatal errors.
+        if (iSent <= 0)
+            return
+        g_iSendOffset += iSent
+        new iLength = (g_iTransportState == SYNC_HEADER) ? g_iHeaderLength : g_iBodyLength
+        if (g_iSendOffset > iLength)
+        {
+            FinishPush(false)
+            return
+        }
+        if (g_iSendOffset == iLength)
+        {
+            g_iSendOffset = 0
+            g_iTransportState++
+        }
+        return
+    }
+
+    // Bounded work per tick. Only clean EOF completes our Connection: close
+    // response, including Node's HTTP/1.0 close-delimited (no length) replies.
+    for (new i = 0; i < 4; i++)
+    {
+        if (!socket_is_readable(g_iActiveSocket, 0))
+            return
+        new szChunk[1024]
+        new iRecv = socket_recv(g_iActiveSocket, szChunk, sizeof(szChunk))
+        if (iRecv < 0)
+        {
+            // No errno is available: never turn an error followed by EOF into
+            // confirmation. A rare readiness race safely retries the ACK later.
+            FinishPush(false)
+            return
+        }
+        if (iRecv == 0)
+        {
+            FinishPush(ValidateSyncResponse())
+            return
+        }
+        if (g_iResponseLength + iRecv > charsmax(g_szRespBuf))
+        {
+            FinishPush(false)
+            return
+        }
+        for (new j = 0; j < iRecv; j++)
+        {
+            if (!szChunk[j])
+            {
+                FinishPush(false)
+                return
+            }
+            g_szRespBuf[g_iResponseLength++] = szChunk[j]
+        }
+        g_szRespBuf[g_iResponseLength] = 0
+    }
+}
+
+FinishPush(bool:bSuccess)
+{
+    remove_task(TASK_POLL)
+    socket_close(g_iActiveSocket)
+    g_iActiveSocket = 0
+    g_iTransportState = 0
+    g_iSentResultCount = 0
+    if (bSuccess)
+    {
+        // Recovery gets one line; routine confirmations only in debug.
+        if (g_iFailStreak >= 3)
+            log_amx("[FreeNova Web Sync] Web panel connection restored.")
+        g_iFailStreak = 0
+        if (get_cvar_num("fnweb_debug") != 0)
+            log_amx("[FreeNova Web Sync] Relay confirmed snapshot and action results.")
+        EvReportAck()
+    }
+    else
+    {
+        g_iFailStreak = min(g_iFailStreak + 1, 5)
+        if (g_iFailStreak == 3)
+            log_amx("[FreeNova Web Sync] Web panel answered but the reply was invalid; actions retained - will retry quietly.")
+    }
+    if (g_bPushAgain)
+    {
+        g_bPushAgain = false
+        if (!task_exists(TASK_PUSH + 1))
+            set_task(0.35, "Task_PushSoon", TASK_PUSH + 1)
+    }
+}
+
+// Strict bounded decimal; no signs, suffixes, integer wrap, or partial numbers.
+SyncDecimal(const szValue[], iLimit)
+{
+    if (!szValue[0]) return -1
+    new iValue = 0
+    for (new i = 0; szValue[i]; i++)
+    {
+        if (!isdigit(szValue[i])) return -1
+        new iDigit = szValue[i] - '0'
+        if (iValue > (iLimit - iDigit) / 10 || iDigit > iLimit) return -1
+        iValue = iValue * 10 + iDigit
+    }
+    return iValue
+}
+
+bool:SyncNumericHost(const szHost[])
+{
+    new szPart[4], iLen = 0, iParts = 0
+    for (new i = 0; ; i++)
+    {
+        if (szHost[i] == '.' || !szHost[i])
+        {
+            szPart[iLen] = 0
+            if (SyncDecimal(szPart, 255) < 0) return false
+            iParts++
+            iLen = 0
+            if (!szHost[i]) return iParts == 4
+            if (iParts >= 4) return false
+        }
+        else
+        {
+            if (iLen >= charsmax(szPart) || !isdigit(szHost[i])) return false
+            szPart[iLen++] = szHost[i]
+        }
+    }
+    return false
+}
+
+bool:ValidateSyncResponse()
+{
+    if (!equal(g_szRespBuf, "HTTP/1.0 200 ", 13) && !equal(g_szRespBuf, "HTTP/1.1 200 ", 13))
+        return false
+    new iHeaders = strfind(g_szRespBuf, "^r^n^r^n")
+    new iLine = strfind(g_szRespBuf, "^r^n")
+    if (iHeaders < 0 || iLine < 0) return false
+    for (new j = 13; j < iLine; j++)
+        if ((g_szRespBuf[j] < 32 && g_szRespBuf[j] != 9) || g_szRespBuf[j] == 127) return false
+    new iBody = iHeaders + 4
+    new iContentLength = -1
+    iLine += 2
+    while (iLine < iHeaders)
+    {
+        new iEnd = strfind(g_szRespBuf[iLine], "^r^n")
+        if (iEnd <= 0 || iEnd > 511) return false
+        new szLine[512], szToken[2]
+        copy(szLine, iEnd, g_szRespBuf[iLine])
+        new iColon = strfind(szLine, ":")
+        if (iColon <= 0) return false
+        // HTTP token names and field values; reject folding/bare CR/LF/controls.
+        for (new j = 0; j < iColon; j++)
+        {
+            szToken[0] = szLine[j]
+            if (!isalnum(szLine[j]) && strfind("!#$%&'*+-.^^_`|~", szToken) == -1) return false
+        }
+        for (new j = iColon + 1; j < iEnd; j++)
+            if ((szLine[j] < 32 && szLine[j] != 9) || szLine[j] == 127) return false
+        szLine[iColon] = 0
+        new iValue = iColon + 1
+        while (szLine[iValue] == ' ' || szLine[iValue] == 9) iValue++
+        new iTail = iEnd - 1
+        while (iTail >= iValue && (szLine[iTail] == ' ' || szLine[iTail] == 9)) szLine[iTail--] = 0
+        if (equali(szLine, "Content-Length"))
+        {
+            if (iContentLength != -1) return false
+            iContentLength = SyncDecimal(szLine[iValue], charsmax(g_szRespBuf))
+            if (iContentLength < 0) return false
+        }
+        // HTTP/1.0 requests do not negotiate chunking or compression.
+        if (equali(szLine, "Transfer-Encoding") || equali(szLine, "Content-Encoding"))
+            return false
+        iLine += iEnd + 2
+    }
+    if (iContentLength != -1 && iContentLength != g_iResponseLength - iBody)
+        return false
+    return SyncJsonObject(g_szRespBuf[iBody])
+}
+
+bool:SyncJsonEnvelope(const szResponse[])
+{
+    // The JSON native checks grammar; this scan bounds nesting and enforces
+    // exactly one whole object (some parsers allow trailing text after a root).
+    new i = 0, iDepth = 0
+    new bool:bString = false
+    while (szResponse[i] == ' ' || szResponse[i] == 9 || szResponse[i] == 10 || szResponse[i] == 13) i++
+    if (szResponse[i] != '{') return false
+    for (; szResponse[i]; i++)
+    {
+        new ch = szResponse[i]
+        if (bString)
+        {
+            if (ch == 92)
+            {
+                // Decoded NUL would silently truncate a native Pawn string.
+                if (!szResponse[i + 1] || equal(szResponse[i + 1], "u0000", 5)) return false
+                i++
+            }
+            else if (ch == '"') bString = false
+            continue
+        }
+        if (ch == '"') bString = true
+        else if (ch == '{' || ch == '[')
+        {
+            if (++iDepth > 32) return false
+        }
+        else if (ch == '}' || ch == ']')
+        {
+            if (--iDepth == 0)
+            {
+                i++
+                while (szResponse[i] == ' ' || szResponse[i] == 9 || szResponse[i] == 10 || szResponse[i] == 13) i++
+                return szResponse[i] == 0
+            }
+        }
+    }
+    return false
+}
+
+bool:SyncJsonObject(const szResponse[])
+{
+    if (!SyncJsonEnvelope(szResponse)) return false
+    new JSON:hRoot = json_parse(szResponse)
+    if (hRoot == Invalid_JSON) return false
+    new bool:bValid = false
+    if (json_is_object(hRoot) && json_object_has_value(hRoot, "ok", JSONBoolean)
+        && json_object_get_bool(hRoot, "ok") && json_object_has_value(hRoot, "actions", JSONArray))
+    {
+        if (json_object_has_value(hRoot, "events", JSONArray))
+        {
+            new JSON:hEvents = json_object_get_value(hRoot, "events")
+            EvtIngestSpecs(hEvents)
+            json_free(hEvents)
+        }
+        new JSON:hActions = json_object_get_value(hRoot, "actions")
+        if (ValidateSyncActions(hActions))
+        {
+            RetireSentResults()
+            ParseAndExecuteActions(hActions)
+            bValid = true
+        }
+        json_free(hActions)
+    }
+    json_free(hRoot)
+    return bValid
+}
+
+bool:ValidateSyncActions(JSON:hActions)
+{
+    new iCount = json_array_get_count(hActions)
+    if (iCount > 8 || iCount + g_iActionResultCount - g_iSentResultCount > MAX_QUEUED_ACTIONS)
+        return false
+    new iIds[8]
+    for (new i = 0; i < iCount; i++)
+    {
+        new JSON:hAction = json_array_get_value(hActions, i)
+        new bool:bValid = false
+        if (json_is_object(hAction) && json_object_has_value(hAction, "id", JSONNumber)
+            && json_object_has_value(hAction, "steamid", JSONString)
+            && json_object_has_value(hAction, "type", JSONString)
+            && json_object_has_value(hAction, "arg", JSONString))
+        {
+            new JSON:hId = json_object_get_value(hAction, "id")
+            new szId[32], szSteamId[41], szType[33], szArg[66]
+            json_serial_to_string(hId, szId, charsmax(szId))
+            json_free(hId)
+            iIds[i] = SyncDecimal(szId, 2147483647)
+            json_object_get_string(hAction, "steamid", szSteamId, charsmax(szSteamId))
+            json_object_get_string(hAction, "type", szType, charsmax(szType))
+            json_object_get_string(hAction, "arg", szArg, charsmax(szArg))
+            bValid = iIds[i] > 0 && strlen(szSteamId) <= 39 && strlen(szType) > 0
+                && strlen(szType) <= 31 && strlen(szArg) <= 64
+        }
+        json_free(hAction)
+        if (!bValid) return false
+        for (new j = 0; j < i; j++)
+            if (iIds[j] == iIds[i]) return false
+        // A returned action whose ACK is still pending must not spend twice.
+        for (new j = 0; j < g_iActionResultCount; j++)
+            if (g_iActionResultId[j] == iIds[i]) return false
+    }
+    return true
+}
+
+RetireSentResults()
+{
+    for (new i = g_iSentResultCount; i < g_iActionResultCount; i++)
+    {
+        new j = i - g_iSentResultCount
+        g_iActionResultId[j] = g_iActionResultId[i]
+        g_bActionResultOk[j] = g_bActionResultOk[i]
+        copy(g_szActionResultMsg[j], charsmax(g_szActionResultMsg[]), g_szActionResultMsg[i])
+    }
+    g_iActionResultCount -= g_iSentResultCount
+    g_iSentResultCount = 0
+}
+
+ParseAndExecuteActions(JSON:hActions)
+{
+    // Only called after validating the entire response/batch. Loopback remains
+    // the response trust boundary; the request signature does not sign replies.
+    new iCount = json_array_get_count(hActions)
+    for (new i = 0; i < iCount; i++)
+    {
+        new JSON:hAction = json_array_get_value(hActions, i)
+        new iActId = json_object_get_number(hAction, "id")
+        new szSteamId[40], szType[32], szArg[65]
+        json_object_get_string(hAction, "steamid", szSteamId, charsmax(szSteamId))
+        json_object_get_string(hAction, "type", szType, charsmax(szType))
+        json_object_get_string(hAction, "arg", szArg, charsmax(szArg))
+        json_free(hAction)
+        ExecuteAction(iActId, szSteamId, szType, szArg)
+    }
+}
+
+stock bool:ArgLooksUnsafe(const szArg[])
+{
+    // Reject quotes, command chaining, and newlines before they reach server_cmd.
+    for (new i; szArg[i]; i++)
+    {
+        if (szArg[i] == '"' || szArg[i] == ';' || szArg[i] == '^n' || szArg[i] == '^r')
+            return true
+    }
+    return false
+}
+
+stock Float:ClampEventMult(Float:fVal)
+{
+    if (fVal < 1.0) return 1.0
+    if (fVal > 5.0) return 5.0
+    return fVal
+}
+
+stock bool:IsWhitelistedMap(const szMap[])
+{
+    static const szMaps[][] = {
+        "de_dust2", "de_inferno", "de_nuke", "de_mirage", "de_cache",
+        "de_cbble", "de_aztec", "de_train", "de_vertigo",
+        "cs_assault", "cs_office", "cs_italy"
+    }
+    for (new i; i < sizeof(szMaps); i++)
+    {
+        if (equali(szMap, szMaps[i]))
+            return true
+    }
+    return false
+}
+
+stock ParseColonParts(const szArg[], szA[], iA, szB[], iB, szC[], iC, szD[], iD)
+{
+    // Split arg on ':' into up to 4 pieces. Empty trailing pieces stay empty.
+    szA[0] = 0; szB[0] = 0; szC[0] = 0; szD[0] = 0
+    new iPart = 0, iCur = 0
+    new szCur[64]
+    for (new i = 0; ; i++)
+    {
+        new ch = szArg[i]
+        if (ch && ch != ':')
+        {
+            if (iCur < charsmax(szCur))
+                szCur[iCur++] = ch
+            continue
+        }
+        szCur[iCur] = 0
+        switch (iPart)
+        {
+            case 0: copy(szA, iA, szCur)
+            case 1: copy(szB, iB, szCur)
+            case 2: copy(szC, iC, szCur)
+            case 3: copy(szD, iD, szCur)
+        }
+        iPart++
+        iCur = 0
+        if (!ch || iPart >= 4)
+            break
+    }
+}
+
+// ---------- FreeNova events settlement (panel-finalized, game-paid) ----------
+// Panel decides winners from authoritative snapshots; the game enforces
+// one-payment-per-event here (nVault survives restarts/retries) and pays
+// through the existing coins/VIP APIs. Offline winners park as pending and
+// are paid on next connect or via claim_event pull.
+// Lifetime counter for an event metric, same natives the push payload uses.
+stock EvtMetricValue(id, const szMetric[])
+{
+    if (equal(szMetric, "kills")) return rsu_get_user_kills(id)
+    if (equal(szMetric, "headshots")) return rsu_get_user_headshots(id)
+    if (equal(szMetric, "wins")) return rsu_get_user_rounds_won(id)
+    if (equal(szMetric, "mvps")) return rsu_get_user_mvp(id)
+    if (equal(szMetric, "xp")) return crxranks_get_user_xp(id)
+    // c4 progress lives in battlepass_core: unreadable while that provider is
+    // absent or the player's BP data is loading. Return -1 (skip) rather than
+    // 0, so no zero baseline is written that would later credit stale progress.
+    if (equal(szMetric, "c4"))
+    {
+        if (!MenabpUsable(id)) return -1
+        return menabp_get_ach_stat(id, 2) + menabp_get_ach_stat(id, 3)
+    }
+    return -1
+}
+stock bool:EvtMetricOk(const szMetric[])
+{
+    return equal(szMetric, "kills") || equal(szMetric, "headshots") || equal(szMetric, "wins") ||
+        equal(szMetric, "mvps") || equal(szMetric, "xp") || equal(szMetric, "c4") ? true : false
+}
+// Auth whitelist for SQL interpolation (STEAM_0:1:NNNNNNN shape only).
+stock bool:EvtAuthOk(const szAuth[])
+{
+    new iLen = strlen(szAuth)
+    if (iLen < 12 || iLen > 39) return false
+    for (new i = 0; i < iLen; i++)
+    {
+        new ch = szAuth[i]
+        if (!isdigit(ch) && ch != ':' && !(ch >= 'A' && ch <= 'Z') && ch != '_') return false
+    }
+    return true
+}
+// Panel event specs ride the push response ("events" array, max 8). Lenient:
+// invalid entries are skipped with a log, valid ones upserted. Panel stays
+// the authority while pushes succeed; these only matter when it goes quiet.
+stock EvtIngestSpecs(JSON:hEvents)
+{
+    if (!json_is_array(hEvents)) return
+    new iCount = json_array_get_count(hEvents)
+    if (iCount > EVT_MAX_SPECS) iCount = EVT_MAX_SPECS
+    new szMetric[16], szScope[16]
+    for (new i = 0; i < iCount; i++)
+    {
+        new JSON:hE = json_array_get_value(hEvents, i)
+        if (hE == Invalid_JSON) continue
+        new iId = json_object_get_number(hE, "id")
+        json_object_get_string(hE, "metric", szMetric, charsmax(szMetric))
+        new iTarget = json_object_get_number(hE, "target")
+        json_object_get_string(hE, "scope", szScope, charsmax(szScope))
+        new iMin = json_object_get_number(hE, "min_score")
+        new iCoins = json_object_get_number(hE, "reward_coins")
+        new iVt = json_object_get_number(hE, "reward_viptier")
+        new iVd = json_object_get_number(hE, "reward_vipdays")
+        new iStart = json_object_get_number(hE, "start_at")
+        new iEnd = json_object_get_number(hE, "end_at")
+        json_free(hE)
+        if (iId <= 0 || !EvtMetricOk(szMetric) || iEnd <= iStart)
+        {
+            log_amx("[FreeNova EvLedger] skipping invalid event spec")
+            continue
+        }
+        if (iCoins < 0 || iCoins > 50000 || iVt < 0 || iVt > 3 || iVd < 0 || iVd > 365 || iMin < 0)
+        {
+            log_amx("[FreeNova EvLedger] skipping event %d: reward out of range", iId)
+            continue
+        }
+        new iScope = equal(szScope, "global") ? 1 : 0
+        new iSlot = -1
+        for (new s = 0; s < g_EvtCount; s++)
+            if (g_EvtId[s] == iId)
+            {
+                iSlot = s
+                break
+            }
+        if (iSlot < 0)
+        {
+            if (g_EvtCount >= EVT_MAX_SPECS) continue
+            iSlot = g_EvtCount++
+        }
+        g_EvtId[iSlot] = iId
+        copy(g_EvtMetric[iSlot], charsmax(g_EvtMetric[]), szMetric)
+        g_EvtTarget[iSlot] = iTarget
+        g_EvtScope[iSlot] = iScope
+        g_EvtMin[iSlot] = iMin
+        g_EvtCoins[iSlot] = iCoins
+        g_EvtVt[iSlot] = iVt
+        g_EvtVd[iSlot] = iVd
+        g_EvtStart[iSlot] = iStart
+        g_EvtEnd[iSlot] = iEnd
+        EvDbSpecStore(iSlot)
+        for (new id = 1; id <= 32; id++)
+            if (is_user_connected(id) && !is_user_bot(id) && !is_user_hltv(id))
+                EvBaselineCapture(id, iSlot)
+    }
+}
+stock EvDbSpecStore(iSlot)
+{
+    if (g_EvtDb == Empty_Handle) return
+    new szQuery[384]
+    formatex(szQuery, charsmax(szQuery),
+        "INSERT OR REPLACE INTO ev_spec (event_id, metric, target, scope, min_score, coins, vtier, vdays, start_at, end_at, updated_at) VALUES (%d,'%s',%d,%d,%d,%d,%d,%d,%d,%d,%d)",
+        g_EvtId[iSlot], g_EvtMetric[iSlot], g_EvtTarget[iSlot], g_EvtScope[iSlot], g_EvtMin[iSlot],
+        g_EvtCoins[iSlot], g_EvtVt[iSlot], g_EvtVd[iSlot], g_EvtStart[iSlot], g_EvtEnd[iSlot], get_systime())
+    SQL_ThreadQuery(g_EvtDb, "HandleEvDbNop", szQuery)
+}
+// Baseline: first-seen lifetime value inside the window. Never credit pre-event.
+stock EvBaselineCapture(id, iSlot)
+{
+    if (!(1 <= id <= 32) || !is_user_connected(id) || is_user_bot(id) || is_user_hltv(id))
+        return
+    if (g_EvtDb == Empty_Handle) return
+    new szAuth[40]
+    copy(szAuth, charsmax(szAuth), GetSafeAuth(id))
+    if (!szAuth[0] || !EvtAuthOk(szAuth)) return
+    if (!crxranks_is_user_loaded(id)) return
+    new iVal = EvtMetricValue(id, g_EvtMetric[iSlot])
+    if (iVal < 0) return
+    new szQuery[256]
+    formatex(szQuery, charsmax(szQuery),
+        "INSERT OR IGNORE INTO ev_base (event_id, auth, metric, baseline, taken_at) VALUES (%d,'%s','%s',%d,%d)",
+        g_EvtId[iSlot], szAuth, g_EvtMetric[iSlot], iVal, get_systime())
+    SQL_ThreadQuery(g_EvtDb, "HandleEvDbNop", szQuery)
+}
+// Last-known current per (auth, metric), refreshed every push for connected
+// players. Finalize reads these, so disconnects don't void progress.
+stock EvCacheSeen(id)
+{
+    if (g_EvtDb == Empty_Handle || g_EvtCount <= 0) return
+    new szAuth[40]
+    copy(szAuth, charsmax(szAuth), GetSafeAuth(id))
+    if (!szAuth[0] || !EvtAuthOk(szAuth)) return
+    new iNow = get_systime()
+    for (new s = 0; s < g_EvtCount; s++)
+    {
+        if (iNow >= g_EvtEnd[s]) continue
+        new iVal = EvtMetricValue(id, g_EvtMetric[s])
+        if (iVal < 0) continue
+        new szQuery[256]
+        formatex(szQuery, charsmax(szQuery),
+            "INSERT OR REPLACE INTO ev_seen (auth, metric, current, updated_at) VALUES ('%s','%s',%d,%d)",
+            szAuth, g_EvtMetric[s], iVal, iNow)
+        SQL_ThreadQuery(g_EvtDb, "HandleEvDbNop", szQuery)
+    }
+}
+// Offline finalize tick (60s). Settles ONLY while pushes fail - while the
+// panel is reachable it owns settlement and this path stays dormant.
+public Task_EvtLedger()
+{
+    if (g_EvtDb == Empty_Handle) return
+    for (new id = 1; id <= 32; id++)
+    {
+        if (!is_user_connected(id) || is_user_bot(id) || is_user_hltv(id)) continue
+        EvMirrorPlayer(id)
+        for (new s = 0; s < g_EvtCount; s++)
+            EvBaselineCapture(id, s)
+    }
+    for (new s = 0; s < g_EvtCount; s++)
+    {
+        if (get_systime() < g_EvtEnd[s] || g_iFailStreak < 3) continue
+        new szQuery[128], szData[32]
+        formatex(szQuery, charsmax(szQuery),
+            "SELECT COUNT(*) FROM ev_win WHERE event_id = %d", g_EvtId[s])
+        formatex(szData, charsmax(szData), "%d %d", s, g_EvtId[s])
+        SQL_ThreadQuery(g_EvtDb, "HandleEvFinalCheck", szQuery, szData, sizeof(szData))
+    }
+}
+public HandleEvFinalCheck(failstate, Handle:query, error[], errnum, data[], size)
+{
+    if (failstate != TQUERY_SUCCESS) return PLUGIN_HANDLED
+    new szS[8], szRest[16]
+    argbreak(data, szS, charsmax(szS), szRest, charsmax(szRest))
+    new s = str_to_num(szS)
+    new iEid = str_to_num(szRest)
+    if (s < 0 || s >= g_EvtCount || g_EvtId[s] != iEid) return PLUGIN_HANDLED
+    if (SQL_ReadResult(query, 0) > 0) return PLUGIN_HANDLED
+    if (g_iFailStreak < 3) return PLUGIN_HANDLED
+    new szQuery[512]
+    formatex(szQuery, charsmax(szQuery),
+        "SELECT b.auth, (CASE WHEN s.current >= b.baseline THEN s.current - b.baseline ELSE 0 END) FROM ev_base b LEFT JOIN ev_seen s ON s.auth = b.auth AND s.metric = b.metric WHERE b.event_id = %d AND b.metric = '%s' ORDER BY 2 DESC, b.auth ASC LIMIT 32",
+        iEid, g_EvtMetric[s])
+    new szData[32]
+    formatex(szData, charsmax(szData), "%d %d", s, iEid)
+    SQL_ThreadQuery(g_EvtDb, "HandleEvFinalize", szQuery, szData, sizeof(szData))
+    return PLUGIN_HANDLED
+}
+public HandleEvFinalize(failstate, Handle:query, error[], errnum, data[], size)
+{
+    if (failstate != TQUERY_SUCCESS) return PLUGIN_HANDLED
+    new szS[8], szRest[16]
+    argbreak(data, szS, charsmax(szS), szRest, charsmax(szRest))
+    new s = str_to_num(szS)
+    new iEid = str_to_num(szRest)
+    if (s < 0 || s >= g_EvtCount || g_EvtId[s] != iEid) return PLUGIN_HANDLED
+    // Panel came back while we were reading: its authority, abort quietly.
+    if (g_iFailStreak < 3) return PLUGIN_HANDLED
+    new iMin = g_EvtMin[s]
+    if (iMin < 1) iMin = 1
+    new iScope = g_EvtScope[s]
+    new iCoins = g_EvtCoins[s], iVt = g_EvtVt[s], iVd = g_EvtVd[s]
+    new iNow = get_systime()
+    // report slot (first free; panel converges without it if full)
+    new r = -1
+    for (new k = 0; k < EVT_MAX_REPORTS; k++)
+        if (g_RepEid[k] <= 0)
+        {
+            r = k
+            break
+        }
+    new szAuth[40], iProg, iPlace = 0, iWrote = 0
+    while (SQL_MoreResults(query))
+    {
+        SQL_ReadResult(query, 0, szAuth, charsmax(szAuth))
+        iProg = SQL_ReadResult(query, 1)
+        SQL_NextRow(query)
+        if (iProg < iMin) continue
+        if (iScope == 0 && iPlace >= 3) break
+        if (iPlace >= EVT_MAX_WINNERS) break
+        iPlace++
+        new bool:bPay = (iScope == 1) || (iPlace == 1)
+        new iC = 0, iT = 0, iD = 0, iPaid = 0
+        if (bPay && (iCoins > 0 || (iVt > 0 && iVd > 0)))
+        {
+            iC = iCoins
+            iT = iVt
+            iD = iVd
+        }
+        new szIns[384]
+        formatex(szIns, charsmax(szIns),
+            "INSERT OR IGNORE INTO ev_win (event_id, placement, auth, score, paid, reported, issued_at) VALUES (%d,%d,'%s',%d,%d,0,%d)",
+            iEid, iPlace, szAuth, iProg, 0, iNow)
+        SQL_ThreadQuery(g_EvtDb, "HandleEvDbNop", szIns)
+        if (iC > 0 || (iT > 0 && iD > 0))
+        {
+            new wid = FindPlayerByAuth(szAuth)
+            new rc = EvtPay(wid, iC, iT, iD)
+            if (rc == 1)
+            {
+                EvtMarkPaid(szAuth, iEid)
+                EvtDropPending(szAuth, iEid)
+                iPaid = 1
+            }
+            else if (rc == 0)
+            {
+                EvtParkPending(szAuth, iEid, iC, iT, iD)
+            }
+            new szUpd[256]
+            formatex(szUpd, charsmax(szUpd),
+                "UPDATE ev_win SET paid = %d, score = %d WHERE event_id = %d AND placement = %d",
+                iPaid, iProg, iEid, iPlace)
+            SQL_ThreadQuery(g_EvtDb, "HandleEvDbNop", szUpd)
+        }
+        if (r >= 0 && iPlace <= EVT_MAX_WINNERS)
+        {
+            copy(g_RepAuth[r][iPlace - 1], 39, szAuth)
+            g_RepScore[r][iPlace - 1] = iProg
+            g_RepPaid[r][iPlace - 1] = iPaid
+        }
+        iWrote++
+    }
+    if (r >= 0 && iWrote > 0)
+    {
+        g_RepEid[r] = iEid
+        g_RepN[r] = (iWrote > EVT_MAX_WINNERS) ? EVT_MAX_WINNERS : iWrote
+        g_RepCount[r] = 0
+    }
+    new szPrune[128]
+    formatex(szPrune, charsmax(szPrune), "DELETE FROM ev_base WHERE event_id = %d", iEid)
+    SQL_ThreadQuery(g_EvtDb, "HandleEvDbNop", szPrune)
+    log_amx("[FreeNova EvLedger] event %d finalized offline: %d winners", iEid, iWrote)
+    return PLUGIN_HANDLED
+}
+// Report section for the push body (bounded; panel dedups regardless).
+stock EvAppendReports()
+{
+    new bool:bAny = false
+    for (new rr = 0; rr < EVT_MAX_REPORTS; rr++)
+        if (g_RepEid[rr] > 0 && g_RepN[rr] > 0)
+        {
+            bAny = true
+            break
+        }
+    if (!bAny) return
+    add(szBody, charsmax(szBody), ",^"event_results^":[")
+    new bool:bFirstE = true
+    for (new rr = 0; rr < EVT_MAX_REPORTS; rr++)
+    {
+        if (g_RepEid[rr] <= 0 || g_RepN[rr] <= 0) continue
+        if (strlen(szBody) + 900 >= charsmax(szBody)) break
+        new szEv[256]
+        formatex(szEv, charsmax(szEv), "%s{^"event_id^":%d,^"finalized_at^":%d,^"winners^":[",
+            bFirstE ? "" : ",", g_RepEid[rr], get_systime())
+        add(szBody, charsmax(szBody), szEv)
+        bFirstE = false
+        for (new w = 0; w < g_RepN[rr]; w++)
+        {
+            new szW[160]
+            formatex(szW, charsmax(szW), "%s{^"steamid^":^"%s^",^"placement^":%d,^"score^":%d,^"paid^":%d}",
+                w ? "," : "", g_RepAuth[rr][w], w + 1, g_RepScore[rr][w], g_RepPaid[rr][w])
+            add(szBody, charsmax(szBody), szW)
+        }
+        add(szBody, charsmax(szBody), "]}")
+    }
+    add(szBody, charsmax(szBody), "]")
+}
+// Successful pushes retire reports after 3 sightings (bounded retry).
+stock EvReportAck()
+{
+    for (new rr = 0; rr < EVT_MAX_REPORTS; rr++)
+    {
+        if (g_RepEid[rr] <= 0) continue
+        if (++g_RepCount[rr] >= 3)
+        {
+            g_RepEid[rr] = 0
+            g_RepN[rr] = 0
+            g_RepCount[rr] = 0
+        }
+    }
+}
+// Single-quote escape for SQL string interpolation (auth/name only).
+stock EvSqlEscape(const szIn[], szOut[], iOut)
+{
+    new n = 0
+    for (new i = 0; szIn[i] && n < iOut - 1; i++)
+    {
+        if (szIn[i] == 39)
+        {
+            if (n + 1 >= iOut - 1) break
+            szOut[n++] = 39
+        }
+        szOut[n++] = szIn[i]
+    }
+    szOut[n] = 0
+}
+// Mirror one connected player into cache_players/cache_weapons. Fire-and-
+// forget; failures only log. Called on the 60s ledger tick + disconnect.
+stock EvMirrorPlayer(id)
+{
+    if (!(1 <= id <= 32) || !is_user_connected(id) || is_user_bot(id) || is_user_hltv(id))
+        return
+    // Same readiness gate as the push payload: never mirror unloaded zeros.
+    if (!crxranks_is_user_loaded(id))
+        return
+    if (g_EvtDb == Empty_Handle) return
+    // Provider down: keep the last mirrored row instead of writing a fake 0
+    // coin balance over it (mirror is read-only for FTP/panel inspection).
+    if (!MenabpUsable(id)) return
+    new szAuth[40]
+    copy(szAuth, charsmax(szAuth), GetSafeAuth(id))
+    if (!szAuth[0] || !EvtAuthOk(szAuth)) return
+    new szName[32], szEscName[64], szEscAuth[80]
+    get_user_name(id, szName, charsmax(szName))
+    EvSqlEscape(szName, szEscName, charsmax(szEscName))
+    EvSqlEscape(szAuth, szEscAuth, charsmax(szEscAuth))
+    new szQuery[768]
+    formatex(szQuery, charsmax(szQuery),
+        "INSERT OR REPLACE INTO cache_players (steamid, name, xp, level, rank_id, prestige, kills, deaths, headshots, wins, mvps, coins, vip_tier, playtime_min, updated_at) VALUES ('%s','%s',%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d)",
+        szEscAuth, szEscName,
+        crxranks_get_user_xp(id), crxranks_get_user_level(id), ClampRank(crxranks_get_user_level(id)), rsu_get_prestige(id),
+        rsu_get_user_kills(id), rsu_get_user_deaths(id), rsu_get_user_headshots(id),
+        rsu_get_user_rounds_won(id), rsu_get_user_mvp(id), menabp_get_coins(id),
+        fnvip_get_tier(id), rsu_get_user_played_time(id) / 60, get_systime())
+    SQL_ThreadQuery(g_EvtDb, "HandleEvDbNop", szQuery)
+    formatex(szQuery, charsmax(szQuery), "DELETE FROM cache_weapons WHERE steamid = '%s'", szEscAuth)
+    SQL_ThreadQuery(g_EvtDb, "HandleEvDbNop", szQuery)
+    for (new slot = 0; slot < 23; slot++)
+    {
+        new iK = fnwps_get_kills(id, slot)
+        if (iK <= 0) continue
+        formatex(szQuery, charsmax(szQuery),
+            "INSERT OR REPLACE INTO cache_weapons (steamid, slot, kills, hs, damage) VALUES ('%s',%d,%d,%d,%d)",
+            szEscAuth, slot, iK, fnwps_get_headshots(id, slot), fnwps_get_damage(id, slot))
+        SQL_ThreadQuery(g_EvtDb, "HandleEvDbNop", szQuery)
+    }
+}
+stock EvtSanitizeAuth(const szAuth[], szOut[], iOut)
+{
+    new n = 0
+    for (new i = 0; szAuth[i] && n < iOut - 1; i++)
+        szOut[n++] = (szAuth[i] == ':' ? '_' : szAuth[i])
+    szOut[n] = 0
+}
+stock EvtPaidKey(const szAuth[], iEid, szOut[], iOut)
+{
+    new szSafe[40]
+    EvtSanitizeAuth(szAuth, szSafe, charsmax(szSafe))
+    formatex(szOut, iOut - 1, "ewpaid_%d_%s", iEid, szSafe)
+}
+stock EvtPendKey(const szAuth[], iEid, szOut[], iOut)
+{
+    new szSafe[40]
+    EvtSanitizeAuth(szAuth, szSafe, charsmax(szSafe))
+    formatex(szOut, iOut - 1, "ewpend_%d_%s", iEid, szSafe)
+}
+stock EvtIndexKey(const szAuth[], szOut[], iOut)
+{
+    new szSafe[40]
+    EvtSanitizeAuth(szAuth, szSafe, charsmax(szSafe))
+    formatex(szOut, iOut - 1, "ewpidx_%s", szSafe)
+}
+stock bool:EvtIsPaid(const szAuth[], iEid)
+{
+    if (g_VaultEvt <= 0)
+        return false
+    new szKey[64], szVal[16]
+    EvtPaidKey(szAuth, iEid, szKey, charsmax(szKey))
+    return nvault_get(g_VaultEvt, szKey, szVal, charsmax(szVal)) ? true : false
+}
+stock EvtMarkPaid(const szAuth[], iEid)
+{
+    if (g_VaultEvt <= 0)
+        return
+    new szKey[64]
+    EvtPaidKey(szAuth, iEid, szKey, charsmax(szKey))
+    nvault_set(g_VaultEvt, szKey, "1")
+}
+stock EvtDropPending(const szAuth[], iEid)
+{
+    if (g_VaultEvt <= 0)
+        return
+    new szKey[64], szIdx[64], szList[128], szKeep[128]
+    EvtPendKey(szAuth, iEid, szKey, charsmax(szKey))
+    nvault_set(g_VaultEvt, szKey, "")
+    EvtIndexKey(szAuth, szIdx, charsmax(szIdx))
+    szKeep[0] = 0
+    if (nvault_get(g_VaultEvt, szIdx, szList, charsmax(szList)))
+    {
+        new szOne[16], szRest[128]
+        copy(szRest, charsmax(szRest), szList)
+        while (szRest[0])
+        {
+            strtok(szRest, szOne, charsmax(szOne), szRest, charsmax(szRest), ',')
+            if (str_to_num(szOne) != iEid)
+            {
+                if (szKeep[0])
+                    add(szKeep, charsmax(szKeep), ",")
+                add(szKeep, charsmax(szKeep), szOne)
+            }
+        }
+    }
+    nvault_set(g_VaultEvt, szIdx, szKeep)
+}
+// Returns: 1 paid now, 0 parked pending (offline/partially unavailable), -1 bad input.
+stock EvtPay(id, iCoins, iVtier, iVdays)
+{
+    // Returns: 1 paid+verified, 0 park (offline or VIP lib down - pays nothing),
+    // -1 bad input, -2 delivered-but-unverified (staff recovery, never re-parked).
+    if (iCoins < 0 || iCoins > 50000 || iVtier < 0 || iVtier > FNVIP_ELITE || iVdays < 0 || iVdays > 365)
+        return -1
+    if (iCoins == 0 && (iVtier <= 0 || iVdays <= 0))
+        return -1
+    if (id <= 0)
+        return 0
+    new bool:bNeedVip = (iVtier >= FNVIP_VIP && iVdays > 0)
+    // VIP library first: never take coins when the grant is unavailable,
+    // otherwise every retry would credit coins again without ever marking paid.
+    if (bNeedVip && !LibraryExists("freenova_vip", LibType_Library))
+        return 0
+    // Wallet provider gate: when battlepass_core is absent or this player's BP
+    // data is still loading, menabp_add_coins silently credits nothing and the
+    // before/after check below returned -2 ("unverified", never re-parked) —
+    // a reward that could then only be fixed by staff. Parking (0) instead
+    // lets the connect / claim_event retry pay it exactly once, correctly.
+    if (iCoins > 0 && !MenabpUsable(id))
+        return 0
+    if (iCoins > 0)
+    {
+        new iBefore = menabp_get_coins(id)
+        menabp_add_coins(id, iCoins)
+        if (menabp_get_coins(id) < iBefore + iCoins)
+            return -2
+    }
+    if (bNeedVip)
+    {
+        fnvip_grant(id, iVtier, iVdays * 86400, FNVIP_SRC_EVENT, "event reward")
+        // Grant never downgrades, so tier below asked means it did not land.
+        if (fnvip_get_tier(id) < iVtier)
+            return -2
+    }
+    return 1
+}
+stock EvtParkPending(const szAuth[], iEid, iCoins, iVtier, iVdays)
+{
+    if (g_VaultEvt <= 0)
+        return
+    new szKey[64], szVal[32], szIdx[64], szList[128]
+    EvtPendKey(szAuth, iEid, szKey, charsmax(szKey))
+    formatex(szVal, charsmax(szVal), "%d:%d:%d", iCoins, iVtier, iVdays)
+    nvault_set(g_VaultEvt, szKey, szVal)
+    EvtIndexKey(szAuth, szIdx, charsmax(szIdx))
+    szList[0] = 0
+    nvault_get(g_VaultEvt, szIdx, szList, charsmax(szList))
+    new bool:bHave = false
+    new szTk[16], szTr[128]
+    copy(szTr, charsmax(szTr), szList)
+    while (szTr[0])
+    {
+        strtok(szTr, szTk, charsmax(szTk), szTr, charsmax(szTr), ',')
+        if (szTk[0] && str_to_num(szTk) == iEid)
+        {
+            bHave = true
+            break
+        }
+    }
+    if (!bHave)
+    {
+        new szNew[128]
+        formatex(szNew, charsmax(szNew), "%s%s%d", szList, szList[0] ? "," : "", iEid)
+        nvault_set(g_VaultEvt, szIdx, szNew)
+    }
+}
+// Pay everything pending for a connected player. Returns count paid.
+// Pay a parked reward by consuming its pending entry. Single-payment rule:
+// a parked-then-intented reward pays HERE from the parked spec, never twice.
+stock bool:EvtConsumePending(const szAuth[], iEid, id)
+{
+    if (g_VaultEvt <= 0 || id <= 0) return false
+    new szKey[64], szVal[32]
+    EvtPendKey(szAuth, iEid, szKey, charsmax(szKey))
+    if (!nvault_get(g_VaultEvt, szKey, szVal, charsmax(szVal)) || !szVal[0]) return false
+    new szC[16], szT[8], szD[8], szJunk[4]
+    ParseColonParts(szVal, szC, charsmax(szC), szT, charsmax(szT), szD, charsmax(szD), szJunk, charsmax(szJunk))
+    if (EvtPay(id, str_to_num(szC), str_to_num(szT), str_to_num(szD)) != 1) return false
+    EvtMarkPaid(szAuth, iEid)
+    EvtDropPending(szAuth, iEid)
+    return true
+}
+stock EvtPayPending(id, const szAuth[], iEidOnly)
+{
+    if (g_VaultEvt <= 0 || id <= 0)
+        return 0
+    new szIdx[64], szList[128]
+    EvtIndexKey(szAuth, szIdx, charsmax(szIdx))
+    if (!nvault_get(g_VaultEvt, szIdx, szList, charsmax(szList)) || !szList[0])
+        return 0
+    new n = 0, szOne[16], szRest[128], szKey[64], szVal[32]
+    new szC[16], szT[8], szD[8], szJunk[4]
+    copy(szRest, charsmax(szRest), szList)
+    while (szRest[0])
+    {
+        strtok(szRest, szOne, charsmax(szOne), szRest, charsmax(szRest), ',')
+        new iEid = str_to_num(szOne)
+        if (iEid <= 0 || (iEidOnly > 0 && iEid != iEidOnly) || EvtIsPaid(szAuth, iEid))
+        {
+            EvtDropPending(szAuth, iEid)
+            continue
+        }
+        EvtPendKey(szAuth, iEid, szKey, charsmax(szKey))
+        if (!nvault_get(g_VaultEvt, szKey, szVal, charsmax(szVal)) || !szVal[0])
+        {
+            EvtDropPending(szAuth, iEid)
+            continue
+        }
+        ParseColonParts(szVal, szC, charsmax(szC), szT, charsmax(szT), szD, charsmax(szD), szJunk, charsmax(szJunk))
+        if (EvtPay(id, str_to_num(szC), str_to_num(szT), str_to_num(szD)) == 1)
+        {
+            EvtMarkPaid(szAuth, iEid)
+            EvtDropPending(szAuth, iEid)
+            n++
+        }
+    }
+    return n
+}
+
+ExecuteAction(iActId, const szSteamId[], const szType[], const szArg[])
+{
+    if (ArgLooksUnsafe(szArg))
+    {
+        RecordActionResult(iActId, false, "unsafe arg")
+        return
+    }
+
+    // Server-wide types run even when steamid is STEAM_0:0:0 / player offline.
+    if (equal(szType, "srv_event_apply"))
+    {
+        // arg: id:xp:coins:type
+        new szEid[32], szXp[16], szCoins[16], szEvType[24]
+        ParseColonParts(szArg, szEid, charsmax(szEid), szXp, charsmax(szXp), szCoins, charsmax(szCoins), szEvType, charsmax(szEvType))
+        new Float:fXp = ClampEventMult(str_to_float(szXp))
+        new Float:fCoins = ClampEventMult(str_to_float(szCoins))
+        set_pcvar_float(g_pEventXp, fXp)
+        set_pcvar_float(g_pEventCoins, fCoins)
+        if (equali(szEvType, "double_xp") && g_pDoubleXp)
+            set_pcvar_num(g_pDoubleXp, 1)
+        log_amx("[FreeNova] EVENT_APPLY id=%s xp=%.2f coins=%.2f", szEid, fXp, fCoins)
+        RecordActionResult(iActId, true, "event applied")
+        client_print_color(0, print_team_default, "^4[FreeNova]^1 Event live: ^3%.1fx XP^1 / ^3%.1fx coins^1.", fXp, fCoins)
+        return
+    }
+
+    if (equal(szType, "srv_event_clear"))
+    {
+        set_pcvar_float(g_pEventXp, 1.0)
+        set_pcvar_float(g_pEventCoins, 1.0)
+        if (g_pDoubleXp)
+            set_pcvar_num(g_pDoubleXp, 0)
+        log_amx("[FreeNova] EVENT_CLEAR")
+        RecordActionResult(iActId, true, "event cleared")
+        client_print_color(0, print_team_default, "^4[FreeNova]^1 Server event ended.")
+        return
+    }
+
+    if (equal(szType, "srv_map"))
+    {
+        if (!IsWhitelistedMap(szArg))
+        {
+            RecordActionResult(iActId, false, "map not whitelisted")
+            return
+        }
+        log_amx("[FreeNova] CHANGELEVEL %s", szArg)
+        RecordActionResult(iActId, true, "changing map")
+        server_cmd("changelevel %s", szArg)
+        return
+    }
+
+    if (equal(szType, "srv_event_reward"))
+    {
+        // arg: eid:coins:viptier:vipdays ; winner rides szSteamId (offline OK).
+        new szEid[12], szCoins[8], szVtier[4], szVdays[6]
+        ParseColonParts(szArg, szEid, charsmax(szEid), szCoins, charsmax(szCoins), szVtier, charsmax(szVtier), szVdays, charsmax(szVdays))
+        new iEid = str_to_num(szEid)
+        new iCoins = str_to_num(szCoins)
+        new iVtier = str_to_num(szVtier)
+        new iVdays = str_to_num(szVdays)
+        if (iEid <= 0 || FNWeb_IsPendingAuth(szSteamId))
+        {
+            RecordActionResult(iActId, false, "bad reward target")
+            return
+        }
+        if (g_VaultEvt <= 0)
+        {
+            log_amx("[FreeNova] EVENT_REWARD eid=%d to=%s VAULT DOWN (staff review)", iEid, szSteamId)
+            RecordActionResult(iActId, false, "vault unavailable")
+            return
+        }
+        if (EvtIsPaid(szSteamId, iEid))
+        {
+            RecordActionResult(iActId, true, "already paid")
+            return
+        }
+        new wid = FindPlayerByAuth(szSteamId)
+        if (wid > 0 && EvtConsumePending(szSteamId, iEid, wid))
+        {
+            log_amx("[FreeNova] EVENT_REWARD eid=%d to=%s paid-from-parked", iEid, szSteamId)
+            RecordActionResult(iActId, true, "paid")
+            client_print_color(wid, print_team_default, "^4[FreeNova]^1 Event reward delivered! Check /events for results.")
+            return
+        }
+        new rc = EvtPay(wid, iCoins, iVtier, iVdays)
+        if (rc == -2)
+        {
+            log_amx("[FreeNova] EVENT_REWARD eid=%d to=%s UNVERIFIED (staff review)", iEid, szSteamId)
+            RecordActionResult(iActId, false, "delivery unverified")
+            return
+        }
+        if (rc < 0)
+        {
+            RecordActionResult(iActId, false, "bad reward amounts")
+            return
+        }
+        if (rc == 0)
+        {
+            EvtParkPending(szSteamId, iEid, iCoins, iVtier, iVdays)
+            log_amx("[FreeNova] EVENT_REWARD eid=%d to=%s parked (offline)", iEid, szSteamId)
+            RecordActionResult(iActId, true, "pending-connect")
+            return
+        }
+        EvtMarkPaid(szSteamId, iEid)
+        EvtDropPending(szSteamId, iEid)
+        log_amx("[FreeNova] EVENT_REWARD eid=%d to=%s coins=%d vtier=%d vdays=%d", iEid, szSteamId, iCoins, iVtier, iVdays)
+        RecordActionResult(iActId, true, "paid")
+        client_print_color(wid, print_team_default, "^4[FreeNova]^1 Event reward delivered! Check /events for results.")
+        return
+    }
+
+    if (FNWeb_IsPendingAuth(szSteamId))
+    {
+        RecordActionResult(iActId, false, "pending auth")
+        return
+    }
+
+    new id = FindPlayerByAuth(szSteamId)
+    if (!id)
+    {
+        RecordActionResult(iActId, false, "player offline")
+        return
+    }
+
+    new szNow[40]
+    copy(szNow, charsmax(szNow), GetSafeAuth(id))
+    if (!szNow[0])
+    {
+        RecordActionResult(iActId, false, "pending auth")
+        return
+    }
+
+    if (equal(szType, "kick"))
+    {
+        new szReason[48]
+        copy(szReason, charsmax(szReason), szArg[0] ? szArg : "kicked by staff")
+        log_amx("[FreeNova] KICK %s reason=%s", szSteamId, szReason)
+        RecordActionResult(iActId, true, "kicked")
+        server_cmd("kick #%d ^"%s^"", get_user_userid(id), szReason)
+        return
+    }
+
+    if (equal(szType, "ban"))
+    {
+        // arg: minutes:reason. The panel keeps ':' inside the reason
+        // (rest.join(":")), so split at the FIRST colon only — splitting on
+        // every colon truncates the reason at each embedded one.
+        new szMin[12], szReason[48]
+        new iColon = contain(szArg, ":")
+        if (iColon >= 0)
+        {
+            copy(szMin, charsmax(szMin), szArg)
+            if (iColon < charsmax(szMin))
+                szMin[iColon] = 0
+            copy(szReason, charsmax(szReason), szArg[iColon + 1])
+        }
+        else
+            copy(szMin, charsmax(szMin), szArg)
+        new iMin = str_to_num(szMin)
+        if (iMin < 0) iMin = 0
+        if (!szReason[0])
+            copy(szReason, charsmax(szReason), "banned by staff")
+        // Advanced Bans owns amx_ban; do not invent a CBan native without the include.
+        log_amx("[FreeNova] BAN %s minutes=%d reason=%s", szSteamId, iMin, szReason)
+        RecordActionResult(iActId, true, "ban queued")
+        server_cmd("amx_ban %s %d ^"%s^"", szSteamId, iMin, szReason)
+        return
+    }
+
+    if (equal(szType, "give_coins"))
+    {
+        new iAmt = str_to_num(szArg)
+        if (iAmt > 50000) iAmt = 50000
+        if (iAmt < -50000) iAmt = -50000
+        if (!iAmt)
+        {
+            RecordActionResult(iActId, false, "zero coins")
+            return
+        }
+        // Provider gate: without it a missing/starting battlepass_core turns
+        // the give into a run-time error and the panel never gets an ACK.
+        if (!MenabpUsable(id))
+        {
+            RecordActionResult(iActId, false, "coin native unavailable")
+            return
+        }
+        menabp_add_coins(id, iAmt)
+        log_amx("[FreeNova] GIVE_COINS %s amount=%d", szSteamId, iAmt)
+        RecordActionResult(iActId, true, "coins applied")
+        client_print_color(id, print_team_default, "^4[FreeNova]^1 Staff adjusted your coins by ^3%d^1.", iAmt)
+        return
+    }
+
+    if (equal(szType, "give_xp"))
+    {
+        new iAmt = str_to_num(szArg)
+        if (iAmt > 100000) iAmt = 100000
+        if (iAmt < -100000) iAmt = -100000
+        // crxranks_give_user_xp is additive-positive. Subtract is unsafe without
+        // a dedicated native; skip negative amounts rather than invent one.
+        if (iAmt <= 0)
+        {
+            RecordActionResult(iActId, false, "xp subtract unsupported")
+            return
+        }
+        crxranks_give_user_xp(id, iAmt)
+        log_amx("[FreeNova] GIVE_XP %s amount=%d", szSteamId, iAmt)
+        RecordActionResult(iActId, true, "xp applied")
+        client_print_color(id, print_team_default, "^4[FreeNova]^1 Staff granted you ^3%d XP^1.", iAmt)
+        return
+    }
+
+    if (equal(szType, "give_vip"))
+    {
+        // arg: tier:days
+        new szTier[8], szDays[12], szUnused[4], szUnused2[4]
+        ParseColonParts(szArg, szTier, charsmax(szTier), szDays, charsmax(szDays), szUnused, charsmax(szUnused), szUnused2, charsmax(szUnused2))
+        new iTier = str_to_num(szTier)
+        new iDays = str_to_num(szDays)
+        if (iTier < FNVIP_VIP) iTier = FNVIP_VIP
+        if (iTier > FNVIP_ELITE) iTier = FNVIP_ELITE
+        if (iDays < 1) iDays = 1
+        if (iDays > 3650) iDays = 3650
+        if (!LibraryExists("freenova_vip", LibType_Library))
+        {
+            RecordActionResult(iActId, false, "vip native unavailable")
+            return
+        }
+        fnvip_grant(id, iTier, iDays * 86400, FNVIP_SRC_PANEL, "staff give_vip")
+        log_amx("[FreeNova] GIVE_VIP %s tier=%d days=%d", szSteamId, iTier, iDays)
+        RecordActionResult(iActId, true, "vip granted")
+        client_print_color(id, print_team_default, "^4[FreeNova]^1 Staff granted you VIP for ^3%d days^1.", iDays)
+        return
+    }
+
+    if (equal(szType, "buy_skin"))
+    {
+        new szGrp[16], szSkin[8]
+        strtok(szArg, szGrp, charsmax(szGrp), szSkin, charsmax(szSkin), ':')
+        new iGroup = FindWeaponGroupByName(szGrp)
+        new iSkin = str_to_num(szSkin)
+
+        if (iGroup == -1 || iSkin < 0 || iSkin >= fn_skins_get_count(iGroup))
+        {
+            RecordActionResult(iActId, false, "invalid skin group or id")
+            return
+        }
+
+        if (fn_skins_is_owned(id, iGroup, iSkin))
+        {
+            fn_skins_set_equipped(id, iGroup, iSkin)
+            RecordActionResult(iActId, true, "already owned, equipped")
+            return
+        }
+
+        // Gates revalidated game-side: panel hiding is display-only, the URL
+        // is craftable, so vipOnly/bpLevel are enforced here before debit.
+        new iCost = fn_skins_get_price(iGroup, iSkin)
+        if (iCost <= 0)
+        {
+            RecordActionResult(iActId, false, "skin is not for sale")
+            return
+        }
+
+        if (!LibraryExists("weapon_models", LibType_Library) || !fn_skins_can_buy(id, iGroup, iSkin))
+        {
+            RecordActionResult(iActId, false, "skin is not for sale")
+            return
+        }
+
+        if (!TryDebitCoins(id, iCost))
+        {
+            RecordActionResult(iActId, false, "coin debit failed")
+            return
+        }
+
+        fn_skins_unlock(id, iGroup, iSkin)
+        new iEq = fn_skins_set_equipped(id, iGroup, iSkin)
+        if (iEq)
+        {
+            RecordActionResult(iActId, true, "purchased and equipped")
+            client_print_color(id, print_team_default, "^4[FreeNova Store]^1 Web Purchase: ^3Skin unlocked & equipped^1 (-%d coins)!", iCost)
+        }
+        else
+        {
+            RecordActionResult(iActId, true, "purchased, not equipped")
+            client_print_color(id, print_team_default, "^4[FreeNova Store]^1 Web Purchase: ^3Skin unlocked^1 (-%d coins). Equip in /skins.", iCost)
+        }
+        return
+    }
+
+    if (equal(szType, "equip_skin"))
+    {
+        new szGrp[16], szSkin[8]
+        strtok(szArg, szGrp, charsmax(szGrp), szSkin, charsmax(szSkin), ':')
+        new iGroup = FindWeaponGroupByName(szGrp)
+        new iSkin = str_to_num(szSkin)
+
+        // Mirror buy_skin: IsSkinOwned treats idx<=0 as the default skin and
+        // set_equipped silently drops out-of-range idx, so an unchecked idx
+        // would ACK "equipped" while nothing changed.
+        if (iGroup != -1 && iSkin >= 0 && iSkin < fn_skins_get_count(iGroup)
+            && fn_skins_is_owned(id, iGroup, iSkin))
+        {
+            fn_skins_set_equipped(id, iGroup, iSkin)
+            RecordActionResult(iActId, true, "skin equipped")
+            client_print_color(id, print_team_default, "^4[FreeNova Store]^1 Skin equipped via web panel!")
+        }
+        else
+        {
+            RecordActionResult(iActId, false, "skin not owned")
+        }
+        return
+    }
+
+    if (equal(szType, "buy_model"))
+    {
+        new iCost = fn_models_get_price(szArg)
+        if (iCost <= 0)
+        {
+            RecordActionResult(iActId, false, "unknown or free model")
+            return
+        }
+        if (fn_models_is_owned(id, szArg))
+        {
+            fn_models_set_equipped(id, szArg, 0)
+            RecordActionResult(iActId, true, "already owned, equipped")
+            return
+        }
+        if (!LibraryExists("weapon_models", LibType_Library) || !fn_models_can_buy(id, szArg))
+        {
+            RecordActionResult(iActId, false, "model not for sale")
+            return
+        }
+        if (!TryDebitCoins(id, iCost))
+        {
+            RecordActionResult(iActId, false, "coin debit failed")
+            return
+        }
+
+        fn_models_unlock(id, szArg)
+        fn_models_set_equipped(id, szArg, 0)
+        RecordActionResult(iActId, true, "purchased and equipped")
+        client_print_color(id, print_team_default, "^4[FreeNova Store]^1 Purchased model ^3%s^1 (-%d coins)!", szArg, iCost)
+        return
+    }
+
+    if (equal(szType, "equip_model"))
+    {
+        if (!fn_models_is_owned(id, szArg) && szArg[0])
+        {
+            RecordActionResult(iActId, false, "model not owned")
+            return
+        }
+        fn_models_set_equipped(id, szArg, 0)
+        RecordActionResult(iActId, true, "model applied")
+        client_print_color(id, print_team_default, "^4[FreeNova Store]^1 Player model updated to ^3%s^1!", szArg)
+        return
+    }
+
+    if (equal(szType, "unequip_model"))
+    {
+        fn_models_set_equipped(id, "", 0)
+        RecordActionResult(iActId, true, "model reset to default")
+        client_print_color(id, print_team_default, "^4[FreeNova Store]^1 Player model reset to default.")
+        return
+    }
+
+    if (equal(szType, "set_tag"))
+    {
+        if (!fncosmetics_has_tag_license(id))
+        {
+            RecordActionResult(iActId, false, "custom tag not owned")
+            return
+        }
+        fncosmetics_set_tag(id, szArg)
+        RecordActionResult(iActId, true, "tag equipped")
+        client_print_color(id, print_team_default, "^4[FreeNova Store]^1 Custom tag updated to ^3%s^1!", szArg)
+        return
+    }
+
+    if (equal(szType, "unequip_tag"))
+    {
+        fncosmetics_clear_tag(id)
+        RecordActionResult(iActId, true, "tag removed")
+        client_print_color(id, print_team_default, "^4[FreeNova Store]^1 Custom tag removed.")
+        return
+    }
+
+    if (equal(szType, "claim_bp"))
+    {
+        // BattlePass milestones award coins server-side when the XP
+        // threshold is crossed. There is no separate web claim.
+        RecordActionResult(iActId, false, "battlepass rewards grant in-game automatically")
+        return
+    }
+
+    if (equal(szType, "buy_skill"))
+    {
+        // Provider gate first: menabp_get_skill_stage is read before the debit,
+        // so a missing/starting battlepass_core must fail here, not mid-action.
+        if (!MenabpUsable(id))
+        {
+            RecordActionResult(iActId, false, "coin native unavailable")
+            return
+        }
+        new iSkill = FindSkillById(szArg)
+        if (iSkill < 0 || iSkill >= SKILL_COUNT)
+        {
+            RecordActionResult(iActId, false, "invalid skill")
+            return
+        }
+
+        new iCur = menabp_get_skill_stage(id, iSkill)
+        new iMax = g_iSkillMaxStage[iSkill]
+        if (iCur >= iMax)
+        {
+            RecordActionResult(iActId, false, "skill already maxed")
+            return
+        }
+
+        new iCost = g_iSkillCosts[iSkill][iCur]
+        if (iCost <= 0)
+        {
+            RecordActionResult(iActId, false, "skill not for sale")
+            return
+        }
+        if (!TryDebitCoins(id, iCost))
+        {
+            RecordActionResult(iActId, false, "coin debit failed")
+            return
+        }
+
+        menabp_set_skill_stage(id, iSkill, iCur + 1)
+        RecordActionResult(iActId, true, "skill upgraded")
+        client_print_color(id, print_team_default, "^4[FreeNova Store]^1 Web Purchase: Upgraded ^3%s^1 to Stage ^4%d/%d^1 (-%d coins)!",
+            g_szSkillIds[iSkill], iCur + 1, iMax, iCost)
+        return
+    }
+
+    if (equal(szType, "claim_mission"))
+    {
+        if (!LibraryExists("freenova_missions", LibType_Library))
+        {
+            RecordActionResult(iActId, false, "missions plugin offline")
+            return
+        }
+        new iGroup, iSlot
+        new iColon = contain(szArg, ":")
+        if (iColon >= 0)
+        {
+            new szLeft[8]
+            copy(szLeft, charsmax(szLeft), szArg)
+            if (iColon < charsmax(szLeft))
+                szLeft[iColon] = 0
+            iGroup = str_to_num(szLeft)
+            iSlot = str_to_num(szArg[iColon + 1])
+        }
+        else
+        {
+            iGroup = 0
+            iSlot = str_to_num(szArg)
+        }
+        if (!fnmsn_claim(id, iGroup, iSlot))
+        {
+            RecordActionResult(iActId, false, "claim rejected")
+            return
+        }
+        RecordActionResult(iActId, true, "mission claimed")
+        return
+    }
+
+    if (equal(szType, "reroll_mission"))
+    {
+        if (!LibraryExists("freenova_missions", LibType_Library))
+        {
+            RecordActionResult(iActId, false, "missions plugin offline")
+            return
+        }
+        new iSlot = str_to_num(szArg)
+        if (!fnmsn_reroll(id, iSlot))
+        {
+            RecordActionResult(iActId, false, "reroll rejected")
+            return
+        }
+        RecordActionResult(iActId, true, "mission rerolled")
+        return
+    }
+
+    if (equal(szType, "claim_mission_all"))
+    {
+        if (!LibraryExists("freenova_missions", LibType_Library))
+        {
+            RecordActionResult(iActId, false, "missions plugin offline")
+            return
+        }
+        new n = fnmsn_claim_all(id)
+        if (n <= 0)
+        {
+            RecordActionResult(iActId, false, "nothing to claim")
+            return
+        }
+        RecordActionResult(iActId, true, "missions claimed")
+        return
+    }
+
+    if (equal(szType, "claim_tournament"))
+    {
+        if (fncomp_is_season_claimed(id))
+        {
+            RecordActionResult(iActId, false, "already claimed this season")
+            client_print_color(id, print_team_default,
+                "^4[FreeNova Tournament]^1 You already claimed this season's prize.")
+            return
+        }
+
+        // Tier strings are recomputed from live rank, never trusted.
+        // Must match the web panel's prizeTier copy exactly.
+        new iRank = fncomp_get_rank(id)
+        new bool:bTierOk = false
+        if (iRank == 1)
+            bTierOk = equal(szArg, "CHAMPION (#1)") ? true : false
+        else if (iRank == 2)
+            bTierOk = equal(szArg, "RUNNER-UP (#2)") ? true : false
+        else if (iRank == 3)
+            bTierOk = equal(szArg, "PODIUM BRONZE (#3)") ? true : false
+        else if (iRank >= 4 && iRank <= 15)
+        {
+            new szWant[32]
+            formatex(szWant, charsmax(szWant), "TOP 15 QUALIFIER (#%d)", iRank)
+            bTierOk = equal(szArg, szWant) ? true : false
+        }
+        else if (equal(szArg, "DAILY STAGE GRAND SLAM"))
+            bTierOk = (fncomp_get_mission_done(id) & 15) == 15 ? true : false
+        else if (equal(szArg, "COMPETITIVE VICTOR"))
+            bTierOk = (fncomp_get_wins(id) >= 5 || fncomp_get_points(id) >= 100) ? true : false
+        if (!bTierOk)
+        {
+            RecordActionResult(iActId, false, "invalid prize tier")
+            client_print_color(id, print_team_default,
+                "^4[FreeNova Tournament]^1 That prize tier does not match your rank. Reopen /tournament.")
+            return
+        }
+
+        new iCoins = fncomp_claim_season_prize(id)
+        if (iCoins <= 0)
+        {
+            RecordActionResult(iActId, false, "no tournament points or wins")
+            client_print_color(id, print_team_default,
+                "^4[FreeNova Tournament]^1 You need tournament points or wins to claim prizes!")
+            return
+        }
+
+        // fncomp_claim_season_prize already credited the coins inside
+        // ClaimSeasonPrize (credit-then-record) and returns the granted
+        // amount. A second menabp_add_coins here double-paid every web claim;
+        // sync now trusts the native return and only ACKs (in-game /cclaim
+        // always took the single-credit path).
+        RecordActionResult(iActId, true, "season prize granted")
+        client_print_color(id, print_team_default,
+            "^4[FreeNova Tournament]^1 Season prize claimed! You received ^4+%d Coins^1.", iCoins)
+        return
+    }
+
+
+    if (equal(szType, "claim_event"))
+    {
+        // arg: eid. Pulls this caller's pending event rewards, if any.
+        new iEid = str_to_num(szArg)
+        if (iEid <= 0)
+        {
+            RecordActionResult(iActId, false, "bad event id")
+            return
+        }
+        new szAuth[40]
+        get_user_authid(id, szAuth, charsmax(szAuth))
+        if (EvtIsPaid(szAuth, iEid))
+        {
+            RecordActionResult(iActId, false, "already claimed")
+            return
+        }
+        new n = EvtPayPending(id, szAuth, iEid)
+        if (n <= 0)
+        {
+            RecordActionResult(iActId, false, "no event reward")
+            return
+        }
+        log_amx("[FreeNova] EVENT_CLAIM %s eid=%d n=%d", szAuth, iEid, n)
+        RecordActionResult(iActId, true, "event reward claimed")
+        return
+    }
+
+    RecordActionResult(iActId, false, "unknown action type")
+}
+
+// Pending event rewards pay here and on an 8s backstop (battlepass/VIP state
+// loads at putinserver, synchronously in the normal path, deferred when the
+// auth was pending - never at client_authorized, which runs too early).
+public client_putinserver(id)
+{
+    if (is_user_bot(id) || is_user_hltv(id))
+        return
+    remove_task(TASK_EVT_LATEPAY + id)
+    set_task(8.0, "Task_EvtLatePay", TASK_EVT_LATEPAY + id)
+    for (new s = 0; s < g_EvtCount; s++)
+        EvBaselineCapture(id, s)
+}
+public Task_EvtLatePay(taskid)
+{
+    new id = taskid - TASK_EVT_LATEPAY
+    if (id < 1 || id > 32 || !is_user_connected(id) || is_user_bot(id) || is_user_hltv(id))
+        return
+    new szAuth[40]
+    get_user_authid(id, szAuth, charsmax(szAuth))
+    if (!szAuth[0] || containi(szAuth, "PENDING") != -1)
+        return
+    if (EvtPayPending(id, szAuth, 0) > 0)
+        client_print_color(id, print_team_default, "^4[FreeNova]^1 Your pending event rewards were delivered.")
+}
+
+RecordActionResult(iActId, bool:bOk, const szMsg[])
+{
+    if (g_iActionResultCount >= MAX_QUEUED_ACTIONS)
+    {
+        // Loud drop: the panel keeps this action `sent` until its 1h expiry
+        // with the player seeing neither success nor failure.
+        log_amx("[FreeNova] Action result queue full, dropped ACK for action %d (%s)", iActId, szMsg)
+        return
+    }
+
+    g_iActionResultId[g_iActionResultCount] = iActId
+    g_bActionResultOk[g_iActionResultCount] = bOk
+    copy(g_szActionResultMsg[g_iActionResultCount], charsmax(g_szActionResultMsg[]), szMsg)
+    g_iActionResultCount++
+
+    // Coalesce one follow-up for both successful and rejected action ACKs.
+    if (!task_exists(TASK_PUSH + 1))
+        set_task(0.35, "Task_PushSoon", TASK_PUSH + 1)
+}
+
+public Task_PushSoon()
+{
+    BuildAndPush()
+}
+
+FindPlayerByAuth(const szAuth[])
+{
+    if (FNWeb_IsPendingAuth(szAuth))
+        return 0
+
+    new iPlayers[MAX_PLAYERS], iNum
+    get_players(iPlayers, iNum, "ch")
+    for (new i; i < iNum; i++)
+    {
+        new id = iPlayers[i]
+        new szUserAuth[40]
+        get_user_authid(id, szUserAuth, charsmax(szUserAuth))
+        if (FNWeb_IsPendingAuth(szUserAuth))
+            continue
+        if (equal(szUserAuth, szAuth))
+            return id
+    }
+    return 0
+}
+
+// menabp provider gate. LibraryExists MUST be evaluated first: menabp_is_ready
+// is itself a battlepass_core native and must never run when the provider is
+// absent (its native is then unbound -> run-time error / load failure).
+// Player-level half mirrors the menabp.inc readiness contract: 0 while that
+// player's BP data is still loading, so every consumer fails closed.
+stock bool:MenabpUsable(id)
+{
+    if (!LibraryExists("menabp", LibType_Library))
+        return false
+    return bool:menabp_is_ready(id)
+}
+
+// Fail closed: unlock/upgrade only after the wallet actually dropped.
+stock bool:TryDebitCoins(id, iCost)
+{
+    // Provider gate: fail-closed debit semantics below are unchanged when the
+    // wallet is up; with it down there is no balance to read or move.
+    if (!MenabpUsable(id))
+        return false
+    new iBefore = menabp_get_coins(id)
+    if (iCost <= 0 || iBefore < iCost)
+        return false
+    new iAfter = menabp_add_coins(id, -iCost)
+    // Other worker: failed spend returns 0. Last-coin success also returns 0,
+    // so also require the wallet to have dropped.
+    if (iAfter == 0 && menabp_get_coins(id) >= iBefore)
+        return false
+    if (menabp_get_coins(id) > iBefore - iCost)
+        return false
+    return true
+}
+
+FindWeaponGroupByName(const szName[])
+{
+    for (new i; i < sizeof(g_szWeaponGroupKeys); i++)
+    {
+        if (equali(szName, g_szWeaponGroupKeys[i]))
+            return i
+    }
+    return -1
+}
+
+ClampRank(iLevel)
+{
+    if (iLevel < 1) return 1
+    new iMax = crxranks_get_max_levels()
+    if (iMax < 1) iMax = 1
+    if (iLevel > iMax) return iMax
+    return iLevel
+}
+
+GetSafeAuth(id)
+{
+    static szAuth[40]
+    get_user_authid(id, szAuth, charsmax(szAuth))
+    if (FNWeb_IsPendingAuth(szAuth))
+        szAuth[0] = 0
+    return szAuth
+}
+
+EscapeJson(const szInput[], szOutput[], iLen)
+{
+    new iPos = 0
+    for (new i; szInput[i] && iPos < iLen - 4; i++)
+    {
+        switch (szInput[i])
+        {
+            case 34, 92:
+            {
+                szOutput[iPos++] = 92
+                szOutput[iPos++] = szInput[i]
+            }
+            case '^n', '^r', '^t':
+                szOutput[iPos++] = ' '
+            default: szOutput[iPos++] = szInput[i]
+        }
+    }
+    szOutput[iPos] = 0
+}

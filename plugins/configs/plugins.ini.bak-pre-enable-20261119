@@ -1,0 +1,118 @@
+; AMX Mod X plugins
+
+; Admin Base - Always one has to be activated
+admin.amxx		; admin base (required for any admin-related)
+;admin_sql.amxx		; admin base - SQL version (comment admin.amxx)
+
+; Basic
+admincmd.amxx		; basic admin console commands (kick/slay/map; ban commands owned by advanced_bans)
+postgres_engine.amxx	; PostgreSQL engine for Advanced Bans (binaries deployed, DB bans@172.17.0.1:5434)
+fn_core.amxx		; platform base: load before fn_audit and advanced_bans
+fn_audit.amxx		; case IDs + audit log: load before advanced_bans/fn_bans
+advanced_bans.amxx	; authoritative ban backend: PG + local mirror; owns CBan natives and amx_ban/unban
+cban_screenshots.amxx	; snapshots on ban via CBan_OnPlayerBannedPre
+; M13-fullstack: bypass_guard.amxx omitted (incomplete chain / binary absent live)
+;bg_provider_iphubclient.amxx	; IPHub lookup — no keys in iphub_api_keys.ini (RTE 1 every map)
+; M13-fullstack: ab_bypass_bridge.amxx omitted (incomplete chain / binary absent live)
+adminhelp.amxx		; help command for admin console commands
+adminslots.amxx		; slot reservation
+;fn_ban_file.amxx		; disabled: duplicate CBan native provider; advanced_bans is authoritative
+fn_bans.amxx		; high-level fn_* ban API and audit/case layer; delegates commands to advanced_bans
+multilingual.amxx	; Multi-Lingual management
+
+; Menus
+menufront.amxx		; front-end for admin menus
+cmdmenu.amxx		; command menu (speech, settings)
+plmenu.amxx		; players menu (kick, ban, client cmds.)
+;telemenu.amxx		; teleport menu (Fun Module required!)
+mapsmenu.amxx		; maps menu (vote, changelevel)
+pluginmenu.amxx		; Menus for commands/cvars organized by plugin
+
+; Chat / Messages
+fn_chat.amxx		; chat gate library (provides fn_chat_can_speak for adminchat)
+adminchat.amxx		; console chat commands
+antiflood.amxx		; prevent clients from chat-flooding the server
+scrollmsg.amxx		; displays a scrolling message
+imessage.amxx		; displays information messages
+adminvote.amxx		; vote commands
+
+; Map related
+nextmap.amxx		; displays next map in mapcycle
+mapchooser.amxx		; allows to vote for next map
+timeleft.amxx		; displays time left on map
+
+; Configuration
+pausecfg.amxx		; allows to pause and unpause some plugins
+statscfg.amxx		; allows to manage stats plugins via menu and commands
+
+
+; Custom - Add 3rd party plugins here
+
+; ==========================================
+; Rank System Ultimate (Tornado AMXX Hub design)
+; ==========================================
+freenova_prefs.amxx          ; Must load before rank/BP/web users
+reapi_healthnade.amxx        ; Real HealthNade weapon/model; BP grants it
+rsu_core.amxx
+rsu_crx_compat.amxx
+rsu_matchstats.amxx
+;rsu_achievements.amxx   ; kill detection moved to fn_on_player_kill; disabled so BattlePass is the single achievement/mission engine
+;rsu_missions.amxx       ; dual mission engine retired — battlepass_core owns dailies/weeklies
+;rsu_happy_hour.amxx        ; superseded by freenova_progression (single happy-hour multiplier owner)
+;rsu_time_rewards.amxx      ; superseded by freenova_progression playtime milestones (single owner)
+;rsu_xp_flags.amxx          ; retired: xp flags belong to the VIP system (fnvip tiers)
+;rsu_xp_menu.amxx           ; retired: redundant XP granting menu (admin panel + shop own rewards)
+;rsu_damage_xp.amxx         ; superseded: fn_dmgxp cvars own damage XP (off by default), one damage ledger
+;rsu_bot_kill_xp.amxx       ; superseded by freenova_progression bot-kill XP (single owner)
+rsu_stats.amxx
+;rsu_top.amxx                 ; source deleted (commit 3050d6e), no binary in plugins/; web /top15 via RSU is the leaderboard
+
+; ==========================================
+; FreeNova Forum In-Game Registration
+; (must load AFTER freenova_vip - consumes fnvip_* natives)
+; ==========================================
+
+; ==========================================
+; FreeNova Unified Progression (RSU core)
+; ==========================================
+freenova_vip.amxx          ; unified 3-tier VIP + merged classic features (tier-gated; replaces vip_ajxs_classic)
+freenova_registration.amxx ; calls fnvip_* for the one-time 72h VIP+ trial (loads after VIP)
+;crx_ranksystem.amxx       ; superseded by RSU (Rank System Ultimate) + rsu_crx_compat
+battlepass_core.amxx
+freenova_achievements.amxx    ; lifetime medals; nVault ach# ; do not enable rsu_achievements
+freenova_missions.amxx        ; daily/weekly; nVault daily# weekly# ; do not enable rsu_missions
+freenova_panel.amxx
+freenova_progression.amxx
+freenova_season.amxx
+freenova_teamxp.amxx          ; assists (XP paid here only - rsu ini assist=0), round/objective team XP
+freenova_hud.amxx            ; FreeNova: white/silver under-radar progression HUD (/hud toggle)
+freenova_weaponstats.amxx    ; FreeNova: per-weapon kill/HS/damage records (leaderboards)
+freenova_hub.amxx            ; FreeNova: /freenova /menu /settings central hub
+freenova_calladmin.amxx      ; FreeNova: /admin /calladmin -> Discord staff webhook via panel
+;freenova_sync.amxx superseded by non-blocking sync below
+weaponmenu.amxx
+weapon_models.amxx
+;multijump.amxx              ; retired: duplicate double-jump executor (battlepass shop skill owns it; both ran => jumps consumed twice)
+parachute.amxx
+simple_warmup.amxx
+rt_core.amxx
+revive_bridge.amxx
+rt_timer.amxx
+rt_bonus.amxx
+rt_effects.amxx
+rt_planting.amxx
+rt_restrictions.amxx
+rt_revive_model.amxx
+rt_sounds.amxx
+;top15_styled.amxx            ; superseded by RSU Top 15 web MOTD
+freenova_competitive.amxx       ; FreeNova: Top15 Points + daily competitive missions (SQLite, /pts /ctop /cmissions)
+freenova_gag.amxx               ; FreeNova: amx_gag/amx_ungag backend for panel (must load BEFORE cosmetics)
+freenova_cosmetics.amxx         ; FreeNova: Spawn & Death Effects, Chat Titles (coins owned by battlepass_core)
+freenova_sync.amxx              ; FreeNova: non-blocking real-data sync & web action queue executor
+
+freenova_clutch.amxx          ; FreeNova: 1v1-1v5 Clutch Tracker & Rewards
+freenova_ads.amxx             ; FreeNova: scheduled chat/HUD ads rotator (configs/freenova/ads.ini)
+freenova_mapvote.amxx         ; FreeNova: RTV/nominate/extend vote (mp_timelimit 0 safe)
+freenova_roundmusic.amxx      ; FreeNova: round-end music + MVP fanfare (default fanfare off, configs/freenova/music.ini)
+freenova_help.amxx            ; FreeNova: amx_cmdhelp/amx_searchcmd/amx_helpmenu + say /cmdhelp registry (M13)
+freenova_admin.amxx           ; FreeNova: expiring admin grants (0 = permanent), fn_admin_* natives (M13)

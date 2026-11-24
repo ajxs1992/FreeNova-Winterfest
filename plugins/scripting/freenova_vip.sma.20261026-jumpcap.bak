@@ -1,0 +1,2700 @@
+#include <amxmodx>
+#include <amxmisc>
+#include <cstrike>
+#include <fun>
+#include <hamsandwich>
+#include <engine>
+#include <fakemeta>
+#include <csx>
+#include <nvault>
+#include <freenova_vip>
+#include <freenova_prefs>
+#include <freenova_reg>
+#include <freenova_web>
+#include <freenova_ui>
+#include <menabp>
+
+#pragma dynamic 16384
+
+#define PLUGIN_NAME     "FreeNova VIP Core"
+#define PLUGIN_VERSION  "2.0.0"
+#define PLUGIN_AUTHOR   "FreeNova Dev Team"
+
+// ============================================================
+// FreeNova Unified VIP - the single authoritative VIP system.
+//
+// v2.0.0: vip_ajxs_classic was merged into this core. Every
+// former classic feature lives here now, gated by tier, so a
+// higher tier unlocks strictly more features. vip_ajxs_classic
+// is retired; do not load it alongside this plugin. The fnvip_*
+// native API is unchanged, so BattlePass, panel, CRX and the
+// weapon-models plugin need no edits.
+//
+// Ownership rules:
+//  - This plugin owns tier truth. Every other plugin asks via the
+//    fnvip_* natives instead of reading flags or keeping its own
+//    VIP state.
+//  - Flags r/q/p are DERIVED here for legacy consumers (CRX VIP XP
+//    table reads flag r live; old configs check r/q/p/t). Bits this
+//    plugin sets are tracked and only those bits are ever removed.
+//  - Entitlements are additive and never overwrite a better one:
+//    resolved tier = highest valid tier across static flags and all
+//    timed entitlements (spec: never downgrade an existing VIP).
+//  - All persistence is per-authid in nVault 'freenova_vip'
+//    (dedicated handle - CRX's vault must never be touched twice).
+// ============================================================
+
+#define MAX_ENT_SOURCES 6
+
+// Registration reward: 72 hours of the middle tier (VIP+)
+#define REG_TRIAL_SECONDS 259200
+
+// Reminder thresholds (seconds remaining) - one notice each
+#define REMIND_24H 86400
+#define REMIND_6H  21600
+#define REMIND_1H  3600
+
+// Per-player task ids MUST use unique bases. AMXX task ids are global across
+// every plugin; raw player index collides with panel TASK_PANEL/TASK_EVENT
+// offsets, adminhelp, CRX, and anything else that set_task(..., id).
+#define TASK_LATE   54000
+#define TASK_VIPIN  54100
+#define TASK_MENU   54200
+#define TASK_VIPTAB 54300
+
+// Legacy runtime flag used by the free-VIP event
+#define VIP_FLAG "r"
+
+// --- Merged classic feature gates (tier required per feature) ---
+// VIP(1):   chat tag, join/leave notices, TAB badge, kill HP/AP/money,
+//           CT defuse kit
+// VIP+(2):  + spawn HP/AP & money, armory menu (/vmenu), VIP player
+//           model, bullet-damage HUD, parachute
+// ELITE(3): + multi-jump, free-VIP event window (perk preview)
+#define TIER_CHAT       FNVIP_VIP
+#define TIER_INOUT      FNVIP_VIP
+#define TIER_TAB        FNVIP_VIP
+#define TIER_KILLBONUS  FNVIP_VIP
+#define TIER_DEFUSEKIT  FNVIP_VIP
+#define TIER_SPAWN      FNVIP_VIPPLUS
+#define TIER_ARMORY     FNVIP_VIPPLUS
+#define TIER_MODEL      FNVIP_VIPPLUS
+#define TIER_BULLETDMG  FNVIP_VIPPLUS
+#define TIER_PARACHUTE  FNVIP_VIPPLUS
+#define TIER_MULTIJUMP  FNVIP_ELITE
+#define TIER_FREEVIP    FNVIP_ELITE
+
+new const g_szVaultName[] = "freenova_vip";
+
+new g_Vault = INVALID_HANDLE;
+new g_fwdTierChanged;
+
+// Resolved runtime state
+new g_Tier[MAX_PLAYERS + 1];        // resolved tier (FNVIP_*)
+new g_StaticTier[MAX_PLAYERS + 1];  // tier from users.ini-style flags
+new g_EntTier[MAX_PLAYERS + 1];     // highest valid entitlement tier
+new g_EntExpire[MAX_PLAYERS + 1];   // its expiry (unix), 0 = none
+new g_EntSource[MAX_PLAYERS + 1];   // its source (FNVIP_SRC_*)
+new g_SyncedBits[MAX_PLAYERS + 1];  // flag bits WE set (never touch others')
+new g_RemindMask[MAX_PLAYERS + 1];  // one-shot trial reminder buckets
+new g_szAuth[MAX_PLAYERS + 1][40];  // normalized authid ("_" for ':')
+new bool:g_bValid[MAX_PLAYERS + 1]; // human with a usable authid
+
+// --- merged classic state ---
+new g_JumpNum[MAX_PLAYERS + 1];
+new bool:g_DoJump[MAX_PLAYERS + 1];
+new bool:g_Use[MAX_PLAYERS + 1];             // armory used this round
+new bool:g_MenuOK[MAX_PLAYERS + 1];          // armory available on this map
+new g_iPrimaryChoice[MAX_PLAYERS + 1];
+new g_iSavedPistol[MAX_PLAYERS + 1];
+new g_iPosition[MAX_PLAYERS + 1];            // damage HUD ring position
+new bool:g_bFreeVipGranted[MAX_PLAYERS + 1]; // event flag WE granted
+new bool:g_bStaticRAtGrant[MAX_PLAYERS + 1]; // users.ini r already present at grant
+new bool:g_bWasFreeVip;
+new CurrentRound;
+new g_iHudSize;
+
+// Registration-state probe (registered players stop seeing the trial ad).
+// The registration plugin is optional; stub the native when it's absent.
+new bool:g_bRegPlugin;
+
+// Cvars
+new g_pEnabled;
+new g_pMultXP[4];    // [1..3]
+new g_pMultBP[4];
+new g_pMultCoin[4];
+new g_pAdEnabled;
+new g_pAdInterval;
+new g_pDebug;
+
+// --- merged classic cvars (same names as vip_ajxs_classic, so an
+// existing vipConfig.cfg keeps working) ---
+new g_pMode;          // vip_mode
+new g_pTag;           // vip_tag
+new g_pTierTags;      // vip_tier_tags
+new g_pStartHP;       // vip_start_hp
+new g_pStartAP;       // vip_start_ap
+new g_pStartMoney;    // vip_start_money
+new g_pJump;          // vip_jump
+new g_pHPKill;        // vip_hp_kill
+new g_pAPKill;        // vip_ap_kill
+new g_pHPHS;          // vip_hp_hs
+new g_pAPHs;          // vip_ap_hs
+new g_pHPKillKnife;   // vip_hp_kill_knife
+new g_pAPKillKnife;   // vip_ap_kill_knife
+new g_pHPHSKnife;     // vip_hp_hs_knife
+new g_pAPHsKnife;     // vip_ap_hs_knife
+new g_pBulletDmg;     // vip_bulletdmg
+new g_pModel;         // vip_model
+new g_pInOut;         // vip_in_out
+new g_pShowChat;      // vip_show_chat
+new g_pMaxHP;         // vip_max_hp
+new g_pMaxAP;         // vip_max_ap
+new g_pParachute;     // vip_parachute
+new g_pMoneyKill;     // vip_money_kill
+new g_pMoneyHS;       // vip_money_hs
+new g_pBulletDmgMode; // vip_bulletdmg_mode
+new g_pTab;           // vip_tab
+new g_pDefuseKit;     // vip_defusekit
+new g_pFreeVip;       // vip_free
+new g_pFreeStart;     // vip_free_start
+new g_pFreeEnd;       // vip_free_end
+new g_pAdminFlag;     // vip_admin_flag
+
+new const g_szVipModelCT[]   = "vip_ct";
+new const g_szVipModelT[]    = "vip_tero";
+new const g_szAdminModelCT[] = "admin_ct";
+new const g_szAdminModelT[]  = "admin_tero";
+
+new g_FileVipCfg[128];  // configs/vipConfig.cfg
+new g_FileVipMaps[128]; // configs/vipMaps.ini
+new bool:g_bMapRestricted;
+
+new const Float:g_flCoords[][] =
+{
+    { 0.50, 0.40 },
+    { 0.56, 0.44 },
+    { 0.60, 0.50 },
+    { 0.56, 0.56 },
+    { 0.50, 0.60 },
+    { 0.44, 0.56 },
+    { 0.40, 0.50 },
+    { 0.44, 0.44 }
+};
+
+enum
+{
+    Primary = 1,
+    Secondary,
+    Knife,
+    Grenades,
+    C4
+};
+
+new const g_szPistolNames[][] = {
+    "None",
+    "Desert Eagle",
+    "USP",
+    "Glock-18"
+};
+
+public plugin_precache()
+{
+    g_Vault = nvault_open(g_szVaultName);
+    if (g_Vault == INVALID_HANDLE)
+        set_fail_state("[FreeNova VIP] cannot open nvault 'freenova_vip'");
+
+    // vip_model is registered here (before plugin_init) so the model
+    // precache can be skipped entirely when disabled.
+    g_pModel = register_cvar("vip_model", "1");
+    if (get_pcvar_num(g_pModel) == 0)
+        return;
+
+    new szPath[128];
+
+    formatex(szPath, charsmax(szPath), "models/player/%s/%s.mdl", g_szVipModelT, g_szVipModelT);
+    if (file_exists(szPath))
+        precache_model(szPath);
+
+    formatex(szPath, charsmax(szPath), "models/player/%s/%s.mdl", g_szVipModelCT, g_szVipModelCT);
+    if (file_exists(szPath))
+        precache_model(szPath);
+
+    formatex(szPath, charsmax(szPath), "models/player/%s/%s.mdl", g_szAdminModelT, g_szAdminModelT);
+    if (file_exists(szPath))
+        precache_model(szPath);
+
+    formatex(szPath, charsmax(szPath), "models/player/%s/%s.mdl", g_szAdminModelCT, g_szAdminModelCT);
+    if (file_exists(szPath))
+        precache_model(szPath);
+}
+
+public plugin_init()
+{
+    register_plugin(PLUGIN_NAME, PLUGIN_VERSION, PLUGIN_AUTHOR);
+    register_library("freenova_vip");
+
+    g_pEnabled    = register_cvar("fnvip_enabled", "1");
+    g_pAdEnabled  = register_cvar("fnvip_ad_enabled", "1");
+    g_pAdInterval = register_cvar("fnvip_ad_interval", "180");
+    g_pDebug      = register_cvar("fnvip_debug", "0");
+
+    // Tier XP multipliers (owner ruling Oct 2026: +50% / +100% / +150%).
+    g_pMultXP[1]   = register_cvar("fnvip_mult_xp_1", "1.50");
+    g_pMultXP[2]   = register_cvar("fnvip_mult_xp_2", "2.00");
+    g_pMultXP[3]   = register_cvar("fnvip_mult_xp_3", "2.50");
+    g_pMultBP[1]   = register_cvar("fnvip_mult_bp_1", "1.05");
+    g_pMultBP[2]   = register_cvar("fnvip_mult_bp_2", "1.10");
+    g_pMultBP[3]   = register_cvar("fnvip_mult_bp_3", "1.15");
+    g_pMultCoin[1] = register_cvar("fnvip_mult_coin_1", "1.50");
+    g_pMultCoin[2] = register_cvar("fnvip_mult_coin_2", "2.00");
+    g_pMultCoin[3] = register_cvar("fnvip_mult_coin_3", "2.50");
+
+    // Merged classic cvars (vip_model was registered in plugin_precache)
+    g_pMode          = register_cvar("vip_mode", "1"); // 2 = auto-open armory on spawn (collides with weaponmenu round-start menu - user report)
+    g_pTag           = register_cvar("vip_tag", "VIP");
+    g_pTierTags      = register_cvar("vip_tier_tags", "1");
+    g_pStartHP       = register_cvar("vip_start_hp", "100");
+    g_pStartAP       = register_cvar("vip_start_ap", "100");
+    g_pStartMoney    = register_cvar("vip_start_money", "1000");
+    g_pJump          = register_cvar("vip_jump", "1");      // ELITE multi-jump (owner ruling Oct 2026): 0 off | 1 double | 2 triple
+    g_pHPKill        = register_cvar("vip_hp_kill", "0");   // Disabled: Earned via BattlePass Vampire
+    g_pAPKill        = register_cvar("vip_ap_kill", "10");
+    g_pHPHS          = register_cvar("vip_hp_hs", "10");
+    g_pAPHs          = register_cvar("vip_ap_hs", "10");
+    g_pHPKillKnife   = register_cvar("vip_hp_kill_knife", "15");
+    g_pAPKillKnife   = register_cvar("vip_ap_kill_knife", "15");
+    g_pHPHSKnife     = register_cvar("vip_hp_hs_knife", "20");
+    g_pAPHsKnife     = register_cvar("vip_ap_hs_knife", "20");
+    g_pBulletDmg     = register_cvar("vip_bulletdmg", "1");
+    g_pInOut         = register_cvar("vip_in_out", "1");
+    g_pShowChat      = register_cvar("vip_show_chat", "1");
+    g_pMaxHP         = register_cvar("vip_max_hp", "200");
+    g_pMaxAP         = register_cvar("vip_max_ap", "200");
+    g_pParachute     = register_cvar("vip_parachute", "1");
+    g_pMoneyKill     = register_cvar("vip_money_kill", "400");
+    g_pMoneyHS       = register_cvar("vip_money_hs", "600");
+    g_pBulletDmgMode = register_cvar("vip_bulletdmg_mode", "5"); // 5 = modern near-crosshair FreeNova style, 2 = fixed ring team colors, 1 = rainbow, 3/4 = center-screen
+    g_pTab           = register_cvar("vip_tab", "1");
+    g_pDefuseKit     = register_cvar("vip_defusekit", "1");
+    g_pFreeVip       = register_cvar("vip_free", "1");
+    g_pFreeStart     = register_cvar("vip_free_start", "22");
+    g_pFreeEnd       = register_cvar("vip_free_end", "08");
+    #pragma unused g_pStartHP, g_pStartAP, g_pJump, g_pHPKill, g_pHPHS, g_pHPKillKnife, g_pHPHSKnife, g_pParachute, g_pMaxHP, g_pAdminFlag
+    g_pAdminFlag     = register_cvar("vip_admin_flag", "d");
+    register_cvar("fn_discord_url", "https://discord.gg/dqrWHhQykp");
+    register_cvar("fn_discord_handle", "zizouondc");
+
+    // All chat commands are routed through the single say hooks below.
+    // No per-command register_clcmd duplicates: the old setup printed the
+    // VIP list / opened the MOTD twice (core + classic both hooked them).
+    register_clcmd("say",      "Cmd_Say");
+    register_clcmd("say_team", "Cmd_SayTeam");
+
+    register_concmd("amx_fngivevip",   "Cmd_GiveVip",   ADMIN_BAN,  "amx_fngivevip <target> <tier 1-3> <hours> - grant timed VIP");
+    register_concmd("amx_fnremovevip", "Cmd_RemoveVip", ADMIN_BAN,  "amx_fnremovevip <target> <tier 1-3|all> - revoke VIP");
+    register_concmd("amx_fnviplist",   "Cmd_VipList",   ADMIN_BAN,  "list resolved VIP tiers with source + expiry");
+
+    set_task(60.0,  "Task_MinuteTick",   0, "", 0, "b");
+    set_task(60.0,  "Task_AdTick",       0, "", 0, "b");    set_task(300.0, "Task_PeriodicInfo", 0, "", 0, "b");
+    // VIP-list HUD removed - the player stats HUD (freenova_hud) owns that screen area
+    set_task(2.0,   "Task_CheckFreeVip", 0, "", 0, "b");
+    RegisterHam(Ham_Spawn, "player", "OnPlayerSpawn", 1);
+    register_forward(FM_PlayerPreThink, "Fwd_VipPreThink");
+
+    g_iHudSize = sizeof(g_flCoords);
+
+    register_event("HLTV", "Event_NewRound", "a", "1=0", "2=0");
+    register_event("TextMsg", "Event_RoundRestart", "a", "2&#Game_w", "2&#Game_C", "2&#Game_will_restart");
+    register_logevent("Event_RoundRestart", 2, "1&Restart_Round_");
+    register_logevent("Event_RoundRestart", 2, "1=Game_Commencing");
+    register_logevent("Event_RoundEnd", 2, "1=Round_End");
+    register_event("ResetHUD", "OnResetHud", "b");
+
+    CurrentRound = 0;
+
+    g_fwdTierChanged = CreateMultiForward("fnvip_tier_changed", ET_IGNORE, FP_CELL, FP_CELL, FP_CELL);
+}
+
+public plugin_natives()
+{
+    register_native("fnvip_get_tier", "_get_tier");
+    register_native("fnvip_has_tier", "_has_tier");
+    register_native("fnvip_has_benefit", "_has_benefit");
+    register_native("fnvip_get_xp_multiplier", "_get_xp_mult");
+    register_native("fnvip_get_bp_multiplier", "_get_bp_mult");
+    register_native("fnvip_get_coin_multiplier", "_get_coin_mult");
+    register_native("fnvip_get_tier_name", "_get_tier_name");
+    register_native("fnvip_get_tier_name_raw", "_get_tier_name_raw");
+    register_native("fnvip_grant", "_grant");
+    register_native("fnvip_revoke", "_revoke");
+    register_native("fnvip_get_remaining", "_get_remaining");
+    register_native("fnvip_claim_registration_trial", "_claim_trial");
+    register_native("fnvip_is_registered_trial_claimed", "_trial_claimed");
+    register_native("fnvip_resync", "_resync");
+    register_native("fnvip_show_vip_motd", "_show_vip_motd");
+    register_native("fnvip_show_vips_list", "_show_vips_list");
+    set_native_filter("NativeFilter");
+}
+
+public NativeFilter(const name[], index, trap)
+{
+    // Registration plugin may be absent; ad gating degrades gracefully.
+    if (equal(name, "freenova_reg_is_registered") || equal(name, "fnreg_is_available") || equal(name, "fnreg_get_state") || equal(name, "menabp_has_weapon_menu_awp") || equal(name, "menabp_has_weapon_menu"))
+        return PLUGIN_HANDLED;
+    return PLUGIN_CONTINUE;
+}
+
+public plugin_end()
+{
+    if (g_Vault != INVALID_HANDLE)
+        nvault_close(g_Vault);
+}
+
+public plugin_cfg()
+{
+    // is_plugin_loaded returns the plugin id or -1
+    g_bRegPlugin = (is_plugin_loaded("freenova_registration.amxx") != -1);
+
+    new szCfg[128];
+    get_configsdir(szCfg, charsmax(szCfg));
+
+    // Core tier config first, then the classic feature config
+    formatex(g_FileVipCfg, charsmax(g_FileVipCfg), "%s/freenova/vip.cfg", szCfg);
+    if (file_exists(g_FileVipCfg))
+        server_cmd("exec %s", g_FileVipCfg);
+
+    get_configsdir(szCfg, charsmax(szCfg));
+    formatex(g_FileVipCfg, charsmax(g_FileVipCfg), "%s/vipConfig.cfg", szCfg);
+    formatex(g_FileVipMaps, charsmax(g_FileVipMaps), "%s/vipMaps.ini", szCfg);
+
+    if (!file_exists(g_FileVipCfg))
+        WriteDefaultVipConfig();
+
+    server_cmd("exec %s", g_FileVipCfg);
+    LoadMapRestrictions();
+}
+
+// ============================================================
+// MERGED CLASSIC: default config writer + map restrictions
+// ============================================================
+WriteDefaultVipConfig()
+{
+    new f[128];
+    copy(f, charsmax(f), g_FileVipCfg);
+    write_file(f, "; ===============================================");
+    write_file(f, "; FreeNova VIP (merged classic) Configuration");
+    write_file(f, "; Tiers: 1 = VIP, 2 = VIP+, 3 = VIP ELITE");
+    write_file(f, "; Features unlock progressively - higher tiers");
+    write_file(f, "; include everything from the tiers below.");
+    write_file(f, "; ===============================================");
+    write_file(f, "");
+    write_file(f, "//// VIP Mode (armory menu)");
+    write_file(f, "// 0 - disabled | 1 - via /vmenu only | 2 - auto menu on spawn");
+    write_file(f, "// Requires VIP+ (tier 2).");
+    write_file(f, "vip_mode ^"1^"");
+    write_file(f, "");
+    write_file(f, "//// VIP Tag (VIP)");
+    write_file(f, "// Chat prefix. With vip_tier_tags 1 the tier name is used instead.");
+    write_file(f, "vip_tag ^"VIP^"");
+    write_file(f, "vip_tier_tags ^"1^"");
+    write_file(f, "");
+    write_file(f, "//// VIP Spawn Stats (VIP+)");
+    write_file(f, "// Spawn Health, Armor, and bonus Money added each round");
+    write_file(f, "vip_start_hp ^"100^"");
+    write_file(f, "vip_start_ap ^"100^"");
+    write_file(f, "vip_start_money ^"1000^"");
+    write_file(f, "");
+    write_file(f, "//// VIP Kill / Headshot Bonuses (VIP)");
+    write_file(f, "vip_hp_kill ^"0^"");
+    write_file(f, "vip_ap_kill ^"10^"");
+    write_file(f, "vip_hp_hs ^"10^"");
+    write_file(f, "vip_ap_hs ^"10^"");
+    write_file(f, "vip_hp_kill_knife ^"15^"");
+    write_file(f, "vip_ap_kill_knife ^"15^"");
+    write_file(f, "vip_hp_hs_knife ^"20^"");
+    write_file(f, "vip_ap_hs_knife ^"20^"");
+    write_file(f, "vip_money_kill ^"400^"");
+    write_file(f, "vip_money_hs ^"600^"");
+    write_file(f, "");
+    write_file(f, "//// VIP Max Limits");
+    write_file(f, "vip_max_hp ^"200^"");
+    write_file(f, "vip_max_ap ^"200^"");
+    write_file(f, "");
+    write_file(f, "//// VIP Multi-Jump (ELITE)");
+    write_file(f, "// 0 - disabled | 1 - double jump | 2 - triple jump");
+    write_file(f, "vip_jump ^"1^"");
+    write_file(f, "");
+    write_file(f, "//// VIP Parachute (VIP+, hold E while falling)");
+    write_file(f, "vip_parachute ^"1^"");
+    write_file(f, "");
+    write_file(f, "//// VIP Defuse Kit (VIP, CT only)");
+    write_file(f, "vip_defusekit ^"1^"");
+    write_file(f, "");
+    write_file(f, "//// VIP Visibility");
+    write_file(f, "// Show VIP connect/disconnect messages (VIP)");
+    write_file(f, "vip_in_out ^"1^"");
+    write_file(f, "// Show online VIPs in chat on /vips");
+    write_file(f, "vip_show_chat ^"1^"");
+    write_file(f, "// (vip_show_hud removed - player stats HUD lives in freenova_hud, toggle with /hud)");
+    write_file(f, "// VIP badge in scoreboard TAB (VIP)");
+    write_file(f, "vip_tab ^"1^"");
+    write_file(f, "");
+    write_file(f, "//// VIP Bullet Damage HUD (VIP+)");
+    write_file(f, "// 0 - disabled | 1 - enabled");
+    write_file(f, "vip_bulletdmg ^"1^"");
+    write_file(f, "// Modes: 1 - circle multicolor | 2 - circle team colored | 3 - center multicolor | 4 - center team colored");
+    write_file(f, "vip_bulletdmg_mode ^"1^"");
+    write_file(f, "");
+    write_file(f, "//// Player Models (VIP+; admin model takes precedence)");
+    write_file(f, "vip_model ^"1^"");
+    write_file(f, "");
+    write_file(f, "//// Admin Model Access Flag");
+    write_file(f, "// Flag required for the Admin model (Default: 'd')");
+    write_file(f, "vip_admin_flag ^"d^"");
+    write_file(f, "");
+    write_file(f, "//// Free VIP Event (grants tier-1 VIP perks to everyone)");
+    write_file(f, "// 0 - disabled | 1 - enabled between vip_free_start and vip_free_end");
+    write_file(f, "vip_free ^"1^"");
+    write_file(f, "// Start and end hours (24h format: 00 to 23)");
+    write_file(f, "vip_free_start ^"22^"");
+    write_file(f, "vip_free_end ^"08^"");
+}
+
+LoadMapRestrictions()
+{
+    if (!file_exists(g_FileVipMaps))
+    {
+        write_file(g_FileVipMaps, ";--------------- | List of maps where VIP menu is restricted | ---------------");
+        write_file(g_FileVipMaps, "1hp");
+        write_file(g_FileVipMaps, "35hp_2_2012");
+        write_file(g_FileVipMaps, "35hp_2");
+        write_file(g_FileVipMaps, "35hp");
+        write_file(g_FileVipMaps, "awp_bycastor");
+        write_file(g_FileVipMaps, "awp_india");
+        write_file(g_FileVipMaps, "awp_map");
+        write_file(g_FileVipMaps, "awp_zigzag");
+        write_file(g_FileVipMaps, "cs_deagle5");
+        write_file(g_FileVipMaps, "css_35hp");
+        write_file(g_FileVipMaps, "css_bycastor");
+        write_file(g_FileVipMaps, "css_deagle");
+        write_file(g_FileVipMaps, "css_india_go");
+        write_file(g_FileVipMaps, "fun_allinone");
+        write_file(g_FileVipMaps, "fy_deagle_complex");
+    }
+
+    new szMap[32], szLine[128], iLen;
+    get_mapname(szMap, charsmax(szMap));
+
+    g_bMapRestricted = false;
+    new iSize = file_size(g_FileVipMaps, 1);
+    for (new i = 0; i < iSize; i++)
+    {
+        read_file(g_FileVipMaps, i, szLine, charsmax(szLine), iLen);
+        trim(szLine);
+        if (szLine[0] == ';' || !szLine[0])
+            continue;
+
+        if (equali(szMap, szLine))
+        {
+            g_bMapRestricted = true;
+            break;
+        }
+    }
+}
+
+// ============================================================
+// LIFECYCLE
+// ============================================================
+// ELITE multi-jump (owner ruling Oct 2026): tier-gated air jumps honoring
+// vip_jump (0 disabled, 1 double, 2 triple). Pure vertical impulse, no
+// damage/money side effects; counts reset on ground, spawn and disconnect.
+public Fwd_VipPreThink(id)
+{
+    if (!(1 <= id <= 32) || !is_user_alive(id))
+        return FMRES_IGNORED
+    if (g_Tier[id] < FNVIP_ELITE)
+    {
+        g_JumpNum[id] = 0
+        return FMRES_IGNORED
+    }
+    new iMax = get_pcvar_num(g_pJump)
+    if (iMax < 1)
+    {
+        g_JumpNum[id] = 0
+        return FMRES_IGNORED
+    }
+    if (iMax > 2)
+        iMax = 2
+    new iFlags = pev(id, pev_flags)
+    if (iFlags & FL_ONGROUND)
+    {
+        g_JumpNum[id] = 0
+        return FMRES_IGNORED
+    }
+    if (pev(id, pev_waterlevel) >= 2)
+        return FMRES_IGNORED
+    new iButtons = pev(id, pev_button)
+    new iOld = pev(id, pev_oldbuttons)
+    if (!(iButtons & IN_JUMP) || (iOld & IN_JUMP))
+        return FMRES_IGNORED
+    if (g_JumpNum[id] >= iMax)
+        return FMRES_IGNORED
+    g_JumpNum[id]++
+    new Float:fVel[3]
+    pev(id, pev_velocity, fVel)
+    fVel[2] = 265.0
+    set_pev(id, pev_velocity, fVel)
+    // swallow the press so one keypress equals one air jump.
+    // IGNORED, never HANDLED: other forwards must still see the think.
+    set_pev(id, pev_oldbuttons, iButtons | IN_JUMP)
+    return FMRES_IGNORED
+}
+
+public client_putinserver(id)
+{
+    g_Tier[id] = FNVIP_NONE;
+    g_StaticTier[id] = FNVIP_NONE;
+    g_EntTier[id] = FNVIP_NONE;
+    g_EntExpire[id] = 0;
+    g_EntSource[id] = -1;
+    g_SyncedBits[id] = 0;
+    g_RemindMask[id] = 0;
+    g_bValid[id] = false;
+    g_szAuth[id][0] = 0;
+    g_JumpNum[id] = 0;
+    g_DoJump[id] = false;
+    g_Use[id] = false;
+    g_MenuOK[id] = !g_bMapRestricted;
+    g_iPrimaryChoice[id] = 0;
+    g_iSavedPistol[id] = 0;
+    g_iPosition[id] = 0;
+    g_bFreeVipGranted[id] = false;
+    g_bStaticRAtGrant[id] = false;
+
+    // Kill stale tasks from the previous slot occupant
+    remove_task(id + TASK_LATE);
+    remove_task(id + TASK_VIPIN);
+    remove_task(id + TASK_MENU);
+    remove_task(id + TASK_VIPTAB); // Task_SetVipTab
+
+    if (is_user_bot(id) || is_user_hltv(id))
+        return;
+
+    // Authid may still be STEAM_ID_PENDING at putinserver; resolve now if
+    // valid and re-resolve once it settles (same pattern as CRX).
+    CaptureAuth(id);
+    if (g_bValid[id])
+        RecheckPlayer(id);
+
+    set_task(5.0, "Task_LateResolve", id + TASK_LATE);
+
+    if (g_Tier[id] >= TIER_INOUT)
+        set_task(2.0, "Task_VipIn", id + TASK_VIPIN);
+}
+
+public Task_LateResolve(taskid)
+{
+    new id = taskid - TASK_LATE;
+    if (!is_user_connected(id))
+        return;
+
+    new szNew[40];
+    if (CaptureAuthInto(id, szNew, charsmax(szNew)))
+    {
+        new bool:bWasVip = (g_Tier[id] >= TIER_INOUT);
+        if (!equal(szNew, g_szAuth[id]))
+        {
+            CopyAuth(id, szNew);
+            g_bValid[id] = true;
+            RecheckPlayer(id);
+
+            // Late tier resolution: fire the join notice that was skipped
+            if (!bWasVip && g_Tier[id] >= TIER_INOUT)
+                set_task(2.0, "Task_VipIn", id + TASK_VIPIN);
+        }
+    }
+    else
+    {
+        // Authid still pending after 5s (slow Steam auth): keep retrying so
+        // flag-based tiers resolve this session instead of after a reconnect
+        // (this was the "/vmenu says I need VIP+ despite having all flags" bug).
+        set_task(3.0, "Task_LateResolve", id + TASK_LATE);
+    }
+}
+
+public client_disconnected(id)
+{
+    // Leave notice must print while the tier/name are still valid -
+    // a delayed task fired into a recycled/empty slot (dead feature in
+    // the classic plugin).
+    if (is_user_connected(id) && g_Tier[id] >= TIER_INOUT && get_pcvar_num(g_pInOut) == 1)
+    {
+        new szName[32], szTag[16];
+        get_user_name(id, szName, charsmax(szName));
+        TierTag(id, szTag, charsmax(szTag));
+        VipChat(0, "^3[%s] ^4%s ^1disconnected from the server.", szTag, szName);
+    }
+
+    g_bValid[id] = false;
+    g_szAuth[id][0] = 0;
+    g_Tier[id] = FNVIP_NONE;
+    g_StaticTier[id] = FNVIP_NONE;
+    g_EntTier[id] = FNVIP_NONE;
+    g_EntExpire[id] = 0;
+    g_EntSource[id] = -1;
+    g_SyncedBits[id] = 0;
+    g_RemindMask[id] = 0;
+    g_JumpNum[id] = 0;
+    g_DoJump[id] = false;
+    g_Use[id] = false;
+    g_MenuOK[id] = !g_bMapRestricted;
+    g_iPrimaryChoice[id] = 0;
+    g_iSavedPistol[id] = 0;
+    g_bFreeVipGranted[id] = false;
+    g_bStaticRAtGrant[id] = false;
+    remove_task(id + TASK_LATE);
+    remove_task(id + TASK_VIPIN);
+    remove_task(id + TASK_MENU);
+    remove_task(id + TASK_VIPTAB); // Task_SetVipTab (slot-reuse guard)
+}
+
+public Task_VipIn(taskid)
+{
+    new id = taskid - TASK_VIPIN;
+    if (!is_user_connected(id) || g_Tier[id] < TIER_INOUT || get_pcvar_num(g_pInOut) != 1)
+        return;
+
+    new szName[32], szTag[16];
+    get_user_name(id, szName, charsmax(szName));
+    TierTag(id, szTag, charsmax(szTag));
+    VipChat(0, "^3[%s] ^4%s ^1connected to the server.", szTag, szName);
+}
+
+CaptureAuth(id)
+{
+    new szAuth[40];
+    g_bValid[id] = CaptureAuthInto(id, szAuth, charsmax(szAuth));
+    if (g_bValid[id])
+        CopyAuth(id, szAuth);
+}
+
+bool:CaptureAuthInto(id, out[], len)
+{
+    get_user_authid(id, out, len);
+
+    // Pending/HLTV/bot authids are not stable identities - refuse them so
+    // no entitlement can be written or read under a shared/pending key.
+    if (!out[0] || equal(out, "STEAM_ID_PENDING") || equal(out, "STEAM_ID_LAN")
+        || equal(out, "UNKNOWN") || equal(out, "BOT") || equal(out, "HLTV"))
+        return false;
+
+    for (new i = 0; out[i]; i++)
+    {
+        if (out[i] == ':')
+            out[i] = '_';
+    }
+    return true;
+}
+
+CopyAuth(id, const szAuth[])
+{
+    copy(g_szAuth[id], charsmax(g_szAuth[]), szAuth);
+}
+
+// ============================================================
+// TIER RESOLUTION
+// ============================================================
+StaticTierFromFlags(id)
+{
+    // Ignore bits this plugin applied from entitlements / synced flags.
+    // Otherwise RecheckPlayer sees its own r/q/p as "static" and timed VIP
+    // can never expire while the player is still connected.
+    new flags = get_user_flags(id) & ~g_SyncedBits[id];
+    // Event-granted r is not static. users.ini r is snapshotted in g_bStaticRAtGrant.
+    if (g_bFreeVipGranted[id] && !g_bStaticRAtGrant[id])
+        flags &= ~read_flags(VIP_FLAG);
+    new tier = FNVIP_NONE;
+
+    // Legacy flag meanings preserved: p=Diamond-class, q=Gold-class,
+    // r/t=VIP-class (t was historically both CRX final-level and a VIP flag).
+    if (flags & read_flags("p"))
+        tier = FNVIP_ELITE;
+    else if (flags & read_flags("q"))
+        tier = FNVIP_VIPPLUS;
+    else if (flags & (read_flags("r") | read_flags("t")))
+        tier = FNVIP_VIP;
+
+    return tier;
+}
+
+// Highest valid entitlement tier; prunes expired keys on sight.
+EntitlementTier(id)
+{
+    if (!g_bValid[id])
+        return FNVIP_NONE;
+
+    new now = get_systime();
+    new best = FNVIP_NONE;
+    new bestExpire, bestSource = -1;
+
+    for (new tier = FNVIP_ELITE; tier >= FNVIP_VIP; tier--)
+    {
+        for (new src = 0; src < MAX_ENT_SOURCES; src++)
+        {
+            new szKey[80];
+            formatex(szKey, charsmax(szKey), "ent#%s#%d#%d", g_szAuth[id], tier, src);
+
+            new ts, szVal[24];
+            if (!nvault_lookup(g_Vault, szKey, szVal, charsmax(szVal), ts))
+                continue;
+
+            new expire = str_to_num(szVal);
+            if (expire <= now)
+            {
+                nvault_remove(g_Vault, szKey); // offline expiry (spec §84)
+                continue;
+            }
+
+            // Same tier: keep the longest remaining entitlement.
+            if (tier > best || (tier == best && expire > bestExpire))
+            {
+                best = tier;
+                bestExpire = expire;
+                bestSource = src;
+            }
+        }
+    }
+
+    g_EntExpire[id] = (best != FNVIP_NONE) ? bestExpire : 0;
+    g_EntSource[id] = bestSource;
+    return best;
+}
+
+ApplySyncedFlags(id, tier)
+{
+    // Keep legacy flag consumers working: r for VIP-class, q for VIP+,
+    // p for ELITE. Only bits that were absent AND that we set are tracked;
+    // static bits from users.ini are never removed.
+    new need = 0;
+    if (tier >= FNVIP_VIP)
+        need |= read_flags("r");
+    if (tier >= FNVIP_VIPPLUS)
+        need |= read_flags("q");
+    if (tier >= FNVIP_ELITE)
+        need |= read_flags("p");
+
+    new flags = get_user_flags(id);
+    new newlySet = need & ~flags;
+
+    if (newlySet)
+        set_user_flags(id, flags | newlySet);
+
+    // Drop bits we previously synced but no longer needed and did not
+    // come from elsewhere now.
+    new stale = g_SyncedBits[id] & ~need;
+    if (stale)
+    {
+        // only remove if not currently present from another source
+        new cur = get_user_flags(id);
+        new toRemove = stale & cur;
+        if (toRemove)
+            remove_user_flags(id, toRemove);
+    }
+
+    g_SyncedBits[id] = (g_SyncedBits[id] & ~stale) | newlySet;
+}
+
+RecheckPlayer(id)
+{
+    if (!is_user_connected(id) || !g_bValid[id])
+        return;
+
+    g_StaticTier[id] = StaticTierFromFlags(id);
+    new entTier = EntitlementTier(id);
+    g_EntTier[id] = entTier;
+    new newTier = max(g_StaticTier[id], entTier);
+    if (g_bFreeVipGranted[id] && newTier < FNVIP_VIP)
+        newTier = FNVIP_VIP;
+
+    ApplySyncedFlags(id, newTier);
+
+    if (newTier != g_Tier[id])
+    {
+        new old = g_Tier[id];
+        g_Tier[id] = newTier;
+        OnTierChanged(id, old, newTier);
+    }
+}
+
+OnTierChanged(id, old, newTier)
+{
+    if (get_pcvar_num(g_pDebug))
+        log_amx("[FreeNova VIP] tier changed: id=%d auth=%s %d -> %d", id, g_szAuth[id], old, newTier);
+
+    new iRet;
+    ExecuteForward(g_fwdTierChanged, iRet, id, old, newTier);
+}
+
+// ============================================================
+// TASKS
+// ============================================================
+public Task_MinuteTick()
+{
+    if (!get_pcvar_num(g_pEnabled))
+        return;
+
+    new players[32], num;
+    get_players(players, num, "ch");
+
+    for (new i = 0; i < num; i++)
+    {
+        new id = players[i];
+        if (!g_bValid[id])
+            continue;
+
+        RecheckPlayer(id);
+        TrialReminders(id);
+    }
+}
+
+TrialReminders(id)
+{
+    // Subtle one-shot reminders near trial end (spec §23).
+    // Skip if static flags already grant VIP+ or better.
+    if (g_EntTier[id] != FNVIP_VIPPLUS || g_EntSource[id] != FNVIP_SRC_REG_TRIAL)
+        return;
+    if (g_StaticTier[id] >= FNVIP_VIPPLUS)
+        return;
+
+    new remaining = g_EntExpire[id] - get_systime();
+    if (remaining <= 0)
+    {
+        RecheckPlayer(id);
+        return;
+    }
+
+    new mask = g_RemindMask[id];
+    new printed;
+
+    // Mark every crossed bucket so a short remaining window cannot skip flags,
+    // then print only the most-urgent unfired notice this tick.
+    if (remaining <= REMIND_1H && !(mask & 4))
+    {
+        mask |= 4;
+        printed = 1;
+        client_print_color(id, print_team_default, "^4[FreeNova]^1 Your free ^3VIP+ trial^1 expires in less than ^31 hour^1.");
+        client_print_color(id, print_team_default, "^4[FreeNova]^1 Type ^4/vip^1 to see permanent VIP options.");
+    }
+    if (remaining <= REMIND_6H && !(mask & 2))
+    {
+        mask |= 2;
+        if (!printed)
+        {
+            printed = 1;
+            client_print_color(id, print_team_default, "^4[FreeNova]^1 Your free ^3VIP+ trial^1 expires in less than ^36 hours^1.");
+            client_print_color(id, print_team_default, "^4[FreeNova]^1 Type ^4/vip^1 to see permanent VIP options.");
+        }
+    }
+    if (remaining <= REMIND_24H && !(mask & 1))
+    {
+        mask |= 1;
+        if (!printed)
+            client_print_color(id, print_team_default, "^4[FreeNova]^1 Your free ^3VIP+ trial^1 expires in less than ^324 hours^1.");
+    }
+
+    g_RemindMask[id] = mask;
+}
+
+public Task_AdTick()
+{
+    if (!get_pcvar_num(g_pEnabled) || !get_pcvar_num(g_pAdEnabled))
+        return;
+
+    // The trial comes FROM registration - without the forum there is
+    // nothing to advertise (standalone game keeps running silently).
+    if (!fnreg_is_available())
+        return;
+
+    new interval = get_pcvar_num(g_pAdInterval);
+    if (interval < 60)
+        interval = 60;
+
+    // Timestamp gate: fires when at least `interval` seconds elapsed since
+    // the last broadcast (robust for any interval, not just multiples of 60).
+    static iLastAd;
+    new now = get_systime();
+    if (iLastAd && now - iLastAd < interval)
+        return;
+    iLastAd = now;
+
+    new players[32], num;
+    get_players(players, num, "ch");
+
+    for (new i = 0; i < num; i++)
+    {
+        new id = players[i];
+        if (!g_bValid[id])
+            continue;
+        if (g_Tier[id] != FNVIP_NONE)
+            continue;
+        if (IsRegistered(id) || TrialClaimed(id))
+            continue;
+
+        client_print_color(id, print_team_default, "^4[FreeNova]^1 Register your account and receive ^4FREE VIP+ for 3 days^1!");
+        client_print_color(id, print_team_default, "^4[FreeNova]^1 Type ^4/register^1 to get started.");
+    }
+}
+
+public Task_PeriodicInfo()
+{
+    if (!get_pcvar_num(g_pEnabled))
+        return;
+
+    // Merged classic msgInfo: benefits reminder + free-VIP event status
+    new szTag[16];
+    GetVipTag(szTag, charsmax(szTag));
+
+    VipChat(0, "^3[%s] ^1Type in chat ^4/vip ^1to view ^3VIP benefits ^1and pricing.", szTag);
+
+    if (get_pcvar_num(g_pFreeVip) == 1)
+    {
+        new startHour = get_pcvar_num(g_pFreeStart);
+        new endHour   = get_pcvar_num(g_pFreeEnd);
+
+        if (IsFreeVipTime())
+            VipChat(0, "^3[%s] ^1Free VIP Event is currently ^4ACTIVE^1! (Ends at ^3%02d:00^1)", szTag, endHour);
+        else
+            VipChat(0, "^3[%s] ^1Free VIP Event is currently ^3INACTIVE^1. It starts at ^4%02d:00 ^1and ends at ^4%02d:00^1.", szTag, startHour, endHour);
+    }
+}
+
+// Task_VipHud removed: retired empty stub, no set_task registered it and
+// nothing else called it. The "VIPs Online" HUD now belongs to
+// freenova_hud (player stats: level/XP/coins).
+
+// ============================================================
+// FREE VIP EVENT (tier-1 perks for everyone, ELITE feature to own)
+// ============================================================
+bool:IsFreeVipTime()
+{
+    if (get_pcvar_num(g_pFreeVip) != 1)
+        return false;
+
+    new o, m, s;
+    time(o, m, s);
+    new startHour = get_pcvar_num(g_pFreeStart);
+    new endHour   = get_pcvar_num(g_pFreeEnd);
+
+    if (startHour == endHour)
+        return false;
+
+    if (startHour > endHour)
+        return (o >= startHour || o < endHour);
+
+    return (o >= startHour && o < endHour);
+}
+
+public Task_CheckFreeVip()
+{
+    if (get_pcvar_num(g_pFreeVip) != 1)
+        return;
+
+    new bool:bNow = IsFreeVipTime();
+
+    if (bNow && !g_bWasFreeVip)
+    {
+        g_bWasFreeVip = true;
+        new endHour = get_pcvar_num(g_pFreeEnd);
+        new szTag[16];
+        GetVipTag(szTag, charsmax(szTag));
+        VipChat(0, "^3[%s] ^4*** FREE VIP EVENT STARTED! *** ^1Everyone has ^4FREE VIP^1 privileges until ^3%02d:00^1!", szTag, endHour);
+    }
+    else if (!bNow && g_bWasFreeVip)
+    {
+        g_bWasFreeVip = false;
+        new szTag[16];
+        GetVipTag(szTag, charsmax(szTag));
+        VipChat(0, "^3[%s] ^4Free VIP Event has ended. ^1Standard permissions resumed. Thanks for playing!", szTag);
+    }
+
+    if (bNow)
+    {
+        new iVipFlag = read_flags(VIP_FLAG);
+        for (new i = 1; i <= MaxClients; i++)
+        {
+            if (is_user_connected(i) && !is_user_bot(i) && !is_user_hltv(i))
+            {
+                new iFlags = get_user_flags(i);
+                if (!g_bFreeVipGranted[i])
+                {
+                    // Snapshot r-at-grant: users.ini/static r must survive teardown.
+                    g_bStaticRAtGrant[i] = (iFlags & iVipFlag) != 0;
+                    g_bFreeVipGranted[i] = true;
+                    if (!(iFlags & iVipFlag))
+                        set_user_flags(i, iFlags | iVipFlag);
+                    RecheckPlayer(i);
+                }
+            }
+        }
+    }
+    else
+    {
+        // Strip only the flag WE granted for the event; never touch the
+        // synced r/q/p bits of real entitlement/flag VIPs.
+        new iVipFlag = read_flags(VIP_FLAG);
+        for (new i = 1; i <= MaxClients; i++)
+        {
+            if (is_user_connected(i) && g_bFreeVipGranted[i])
+            {
+                new bool:bKeepStatic = g_bStaticRAtGrant[i];
+                g_bFreeVipGranted[i] = false;
+                g_bStaticRAtGrant[i] = false;
+                new iFlags = get_user_flags(i);
+                new bool:bHasHigherTier = (iFlags & (read_flags("q") | read_flags("p"))) != 0;
+                if (!bKeepStatic && !bHasHigherTier && !(g_SyncedBits[i] & iVipFlag))
+                    remove_user_flags(i, iVipFlag);
+
+                RecheckPlayer(i); // drop tier-1 features immediately
+            }
+        }
+    }
+}
+
+// ============================================================
+// COMMANDS
+// ============================================================
+public Cmd_Say(id)
+    return HandleChat(id, false);
+
+public Cmd_SayTeam(id)
+    return HandleChat(id, true);
+
+public HandleChat(id, bool:bIsTeam)
+{
+    if (!is_user_connected(id))
+        return PLUGIN_CONTINUE;
+
+    static szSaid[192];
+    read_args(szSaid, charsmax(szSaid));
+    remove_quotes(szSaid);
+    trim(szSaid);
+
+    if (!szSaid[0])
+        return PLUGIN_CONTINUE;
+
+    // Chat commands routed here (single handler - the old setup printed
+    // the list / MOTD twice because two plugins hooked the same commands)
+    if (equal(szSaid, "/vips"))
+    {
+        ShowVipsList(id);
+        return PLUGIN_HANDLED;
+    }
+    else if (equal(szSaid, "/vip"))
+    {
+        ShowVipCenter(id);
+        return PLUGIN_HANDLED;
+    }
+    else if (equal(szSaid, "/vipinfo"))
+    {
+        ShowVipMotd(id);
+        return PLUGIN_HANDLED;
+    }
+    else if (equal(szSaid, "/vmenu") || equal(szSaid, "/vm"))
+    {
+        Cmd_VMenu(id);
+        return PLUGIN_HANDLED;
+    }
+
+    // Commands starting with '/', '!', '.', ',', '@', '#' must NEVER be tagged as VIP chat
+    // and must pass through untouched so other plugins (e.g. Custom Shop) can process them.
+    if (IsChatCommand(szSaid))
+        return PLUGIN_CONTINUE;
+
+    // If freenova_cosmetics is running, delegate chat formatting to freenova_cosmetics
+    // to allow custom tags, chat titles, and custom chat colors without duplicate messages.
+    if (LibraryExists("freenova_cosmetics", LibType_Library))
+        return PLUGIN_CONTINUE;
+
+    // Non-VIP players: standard untagged CS 1.6 chat
+    if (g_Tier[id] < TIER_CHAT)
+        return PLUGIN_CONTINUE;
+
+    // VIP player with normal chat message: format with tier tag
+    static szTag[16];
+    TierTag(id, szTag, charsmax(szTag));
+
+    static szName[32];
+    get_user_name(id, szName, charsmax(szName));
+
+    new CsTeams:team = cs_get_user_team(id);
+    new bool:bAlive = bool:is_user_alive(id);
+    static szFormatted[256];
+
+    if (!bIsTeam)
+    {
+        if (team == CS_TEAM_SPECTATOR || team == CS_TEAM_UNASSIGNED)
+            formatex(szFormatted, charsmax(szFormatted), "^1*SPEC* ^4[%s] ^3%s^1 :  %s", szTag, szName, szSaid);
+        else if (!bAlive)
+            formatex(szFormatted, charsmax(szFormatted), "^1*DEAD* ^4[%s] ^3%s^1 :  %s", szTag, szName, szSaid);
+        else
+            formatex(szFormatted, charsmax(szFormatted), "^4[%s] ^3%s^1 :  %s", szTag, szName, szSaid);
+    }
+    else
+    {
+        if (team == CS_TEAM_SPECTATOR || team == CS_TEAM_UNASSIGNED)
+            formatex(szFormatted, charsmax(szFormatted), "^1(Spectator) ^4[%s] ^3%s^1 :  %s", szTag, szName, szSaid);
+        else if (team == CS_TEAM_T)
+        {
+            if (!bAlive)
+                formatex(szFormatted, charsmax(szFormatted), "^1*DEAD*(Terrorist) ^4[%s] ^3%s^1 :  %s", szTag, szName, szSaid);
+            else
+                formatex(szFormatted, charsmax(szFormatted), "^1(Terrorist) ^4[%s] ^3%s^1 :  %s", szTag, szName, szSaid);
+        }
+        else // CS_TEAM_CT
+        {
+            if (!bAlive)
+                formatex(szFormatted, charsmax(szFormatted), "^1*DEAD*(Counter-Terrorist) ^4[%s] ^3%s^1 :  %s", szTag, szName, szSaid);
+            else
+                formatex(szFormatted, charsmax(szFormatted), "^1(Counter-Terrorist) ^4[%s] ^3%s^1 :  %s", szTag, szName, szSaid);
+        }
+    }
+
+    // Send to all eligible players
+    static iPlayers[32], iNum;
+    get_players(iPlayers, iNum, "ch");
+
+    for (new i = 0; i < iNum; i++)
+    {
+        new iTarget = iPlayers[i];
+        if (!CanPlayerHearChat(id, iTarget, bIsTeam))
+            continue;
+
+        SendSayText(id, iTarget, szFormatted);
+    }
+
+    static szAuth[32];
+    get_user_authid(id, szAuth, charsmax(szAuth));
+    log_message("^"%s<%d><%s><>^" %s ^"%s^"", szName, get_user_userid(id), szAuth, bIsTeam ? "say_team" : "say", szSaid);
+
+    return PLUGIN_HANDLED;
+}
+
+public Cmd_VMenu(id)
+{
+    new szTag[16];
+    GetVipTag(szTag, charsmax(szTag));
+
+    if (!get_pcvar_num(g_pEnabled))
+        return PLUGIN_HANDLED;
+
+    if (get_pcvar_num(g_pMode) == 0)
+    {
+        VipChat(id, "^3[%s] ^1VIP Menu is currently ^3disabled^1.", szTag);
+        return PLUGIN_HANDLED;
+    }
+    if (IsWarmupRunning())
+    {
+        VipChat(id, "^3[%s] ^1VIP Menu is ^3disabled^1 during the knife warmup round.", szTag);
+        return PLUGIN_HANDLED;
+    }
+    if (!is_user_alive(id))
+    {
+        VipChat(id, "^3[%s] ^1You must be ^3alive^1 to use the VIP Menu.", szTag);
+        return PLUGIN_HANDLED;
+    }
+    if (!ArmoryAccess(id))
+    {
+        new szStatus[16];
+        if (g_Tier[id] == FNVIP_NONE)
+            copy(szStatus, charsmax(szStatus), "Member");
+        else
+            TierName(g_Tier[id], szStatus, charsmax(szStatus));
+
+        VipChat(id, "^3[%s] ^1The VIP Armory requires ^4VIP+^1 or the ^3BattlePass Weapon Menu^1 (your status: ^3%s^1).", szTag, szStatus);
+        return PLUGIN_HANDLED;
+    }
+    if (!g_MenuOK[id])
+    {
+        VipChat(id, "^3[%s] ^1VIP Menu is disabled on this map.", szTag);
+        return PLUGIN_HANDLED;
+    }
+    if (g_Use[id])
+    {
+        VipChat(id, "^3[%s] ^1You already used your weapon menu this round.", szTag);
+        return PLUGIN_HANDLED;
+    }
+
+    if (CurrentRound <= 1)
+    {
+        ShowPistolMenu(id);
+    }
+    else if (CurrentRound == 2)
+    {
+        ShowRound2Menu(id);
+    }
+    else
+    {
+        ShowRound3Menu(id);
+    }
+    return PLUGIN_HANDLED;
+}
+
+public Cmd_GiveVip(id, level, cid)
+{
+    if (!cmd_access(id, level, cid, 4))
+        return PLUGIN_HANDLED;
+
+    new szArg[32], szTier[8], szHours[12];
+    read_argv(1, szArg, charsmax(szArg));
+    read_argv(2, szTier, charsmax(szTier));
+    read_argv(3, szHours, charsmax(szHours));
+
+    new target = cmd_target(id, szArg, CMDTARGET_ALLOW_SELF);
+    if (!target)
+        return PLUGIN_HANDLED;
+
+    new tier = str_to_num(szTier);
+    new hours = str_to_num(szHours);
+    if (tier < FNVIP_VIP || tier > FNVIP_ELITE || hours <= 0 || hours > 87600)
+    {
+        console_print(id, "[FreeNova VIP] tier must be 1-3 and hours 1-87600 (10y max)");
+        return PLUGIN_HANDLED;
+    }
+
+    if (!g_bValid[target])
+    {
+        console_print(id, "[FreeNova VIP] target has no valid SteamID yet");
+        return PLUGIN_HANDLED;
+    }
+
+    fnGrant(target, tier, hours * 3600, FNVIP_SRC_ADMIN);
+
+    new szAdmin[32], szName[32];
+    get_user_name(id, szAdmin, charsmax(szAdmin));
+    get_user_name(target, szName, charsmax(szName));
+    new szTierName[16];
+    TierName(tier, szTierName, charsmax(szTierName));
+
+    client_print_color(target, print_team_default, "^4[FreeNova]^1 You received ^4%s^1 for ^3%d hours^1 (admin grant).", szTierName, hours);
+    console_print(id, "[FreeNova VIP] granted %s (%dh) to %s", szTierName, hours, szName);
+    log_amx("[FreeNova VIP] ADMIN '%s' granted %s %dh to %s (%s)", szAdmin, szTierName, hours, szName, g_szAuth[target]);
+    return PLUGIN_HANDLED;
+}
+
+public Cmd_RemoveVip(id, level, cid)
+{
+    if (!cmd_access(id, level, cid, 3))
+        return PLUGIN_HANDLED;
+
+    new szArg[32], szTier[8];
+    read_argv(1, szArg, charsmax(szArg));
+    read_argv(2, szTier, charsmax(szTier));
+
+    new target = cmd_target(id, szArg, CMDTARGET_ALLOW_SELF);
+    if (!target || !g_bValid[target])
+        return PLUGIN_HANDLED;
+
+    if (equal(szTier, "all"))
+    {
+        for (new tier = FNVIP_VIP; tier <= FNVIP_ELITE; tier++)
+            for (new src = 0; src < MAX_ENT_SOURCES; src++)
+                RevokeKey(target, tier, src);
+    }
+    else
+    {
+        new tier = str_to_num(szTier);
+        if (tier < FNVIP_VIP || tier > FNVIP_ELITE)
+        {
+            console_print(id, "[FreeNova VIP] tier must be 1-3 or 'all'");
+            return PLUGIN_HANDLED;
+        }
+        for (new src = 0; src < MAX_ENT_SOURCES; src++)
+            RevokeKey(target, tier, src);
+    }
+
+    RecheckPlayer(target);
+    client_print_color(target, print_team_default, "^4[FreeNova]^1 Your VIP entitlements were ^3revoked^1 by an admin.");
+    new szAdmin[32], szName[32];
+    get_user_name(id, szAdmin, charsmax(szAdmin));
+    get_user_name(target, szName, charsmax(szName));
+    log_amx("[FreeNova VIP] ADMIN '%s' revoked VIP for %s (%s)", szAdmin, szName, g_szAuth[target]);
+    return PLUGIN_HANDLED;
+}
+
+public Cmd_VipList(id, level, cid)
+{
+    if (!cmd_access(id, level, cid, 1))
+        return PLUGIN_HANDLED;
+
+    console_print(id, "=== FreeNova VIP - online players ===");
+    new players[32], num;
+    get_players(players, num, "ch");
+
+    for (new i = 0; i < num; i++)
+    {
+        new pid = players[i];
+        new tier = g_Tier[pid];
+        if (pid == 0 || !is_user_connected(pid))
+            continue;
+
+        new szName[32], szTierName[16], szExpire[32];
+        get_user_name(pid, szName, charsmax(szName));
+        TierName(tier, szTierName, charsmax(szTierName));
+
+        if (tier == FNVIP_NONE)
+            formatex(szExpire, charsmax(szExpire), "-");
+        else if (g_EntTier[pid] > 0 && g_EntTier[pid] == tier)
+            FormatDuration(g_EntExpire[pid] - get_systime(), szExpire, charsmax(szExpire));
+        else
+            copy(szExpire, charsmax(szExpire), "static (no expiry)");
+
+        console_print(id, "%-24s tier=%-9s source=%d expires=%s", szName, szTierName, g_EntSource[pid], szExpire);
+    }
+    return PLUGIN_HANDLED;
+}
+
+// ============================================================
+// MOTD
+// ============================================================
+ShowVipMotd(id)
+{
+    if (FNWeb_OpenPage(id, "vip"))
+        return;
+
+    static szMotd[4096];
+    new iLen = FN_MotdHeader(szMotd, charsmax(szMotd), "VIP");
+    iLen += copy(szMotd[iLen], charsmax(szMotd) - iLen, "<table class='fnt'>");
+    iLen += formatex(szMotd[iLen], charsmax(szMotd) - iLen,
+        "<tr><th>Benefit</th><th>VIP</th><th>VIP+</th><th>VIP Elite</th></tr>");
+    iLen += formatex(szMotd[iLen], charsmax(szMotd) - iLen,
+        "<tr><td class='k'>XP bonus</td><td>+%d%%</td><td>+%d%%</td><td>+%d%%</td></tr>",
+        floatround((get_pcvar_float(g_pMultXP[1]) - 1.0) * 100.0),
+        floatround((get_pcvar_float(g_pMultXP[2]) - 1.0) * 100.0),
+        floatround((get_pcvar_float(g_pMultXP[3]) - 1.0) * 100.0));
+    new Float:fCoin1 = get_pcvar_float(g_pMultCoin[1]);
+    new Float:fCoin2 = get_pcvar_float(g_pMultCoin[2]);
+    new Float:fCoin3 = get_pcvar_float(g_pMultCoin[3]);
+    iLen += formatex(szMotd[iLen], charsmax(szMotd) - iLen,
+        "<tr><td class='k'>Coin bonus</td><td>%.2fx</td><td>%.2fx</td><td>%.2fx</td></tr>",
+        fCoin1, fCoin2, fCoin3);
+    iLen += formatex(szMotd[iLen], charsmax(szMotd) - iLen,
+        "<tr><td class='k'>Chat tag, online list, scoreboard</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>");
+    iLen += formatex(szMotd[iLen], charsmax(szMotd) - iLen,
+        "<tr><td class='k'>Kill AP &amp; money</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>");
+    iLen += formatex(szMotd[iLen], charsmax(szMotd) - iLen,
+        "<tr><td class='k'>CT defuse kit</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>");
+    iLen += formatex(szMotd[iLen], charsmax(szMotd) - iLen,
+        "<tr><td class='k'>Battle Pass premium track</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>");
+    iLen += formatex(szMotd[iLen], charsmax(szMotd) - iLen,
+        "<tr><td class='k'>Spawn money</td><td>-</td><td>Yes</td><td>Yes</td></tr>");
+    iLen += formatex(szMotd[iLen], charsmax(szMotd) - iLen,
+        "<tr><td class='k'>VIP Armory (/vmenu)</td><td>-</td><td>Yes</td><td>Yes</td></tr>");
+    iLen += formatex(szMotd[iLen], charsmax(szMotd) - iLen,
+        "<tr><td class='k'>VIP player model</td><td>-</td><td>Yes</td><td>Yes</td></tr>");
+    iLen += formatex(szMotd[iLen], charsmax(szMotd) - iLen,
+        "<tr><td class='k'>Damage indicator HUD</td><td>-</td><td>Yes</td><td>Yes</td></tr>");
+    iLen += copy(szMotd[iLen], charsmax(szMotd) - iLen, "</table>");
+    iLen += copy(szMotd[iLen], charsmax(szMotd) - iLen,
+        "<p>Higher tiers include everything below. Night Free VIP is a server-wide event.</p>");
+    if (fnreg_is_available())
+    {
+        iLen += formatex(szMotd[iLen], charsmax(szMotd) - iLen,
+            "<p class='fngreen'><b>Register your account - FREE VIP+ 3 days!</b> Type /register.</p>");
+    }
+    new szHandle[32]
+    FN_GetDiscordHandle(szHandle, charsmax(szHandle))
+    iLen += formatex(szMotd[iLen], charsmax(szMotd) - iLen,
+        "<p>Permanent VIP? Contact us on Discord: <b>%s</b> (ask staff in-game)</p>",
+        szHandle);
+    iLen += FN_MotdFooter(szMotd, charsmax(szMotd), iLen);
+
+    FN_MotdShow(id, szMotd, "FreeNova VIP");
+}
+
+ShowVipsList(id)
+{
+    if (get_pcvar_num(g_pShowChat) != 1)
+        return;
+
+    new szTag[16];
+    GetVipTag(szTag, charsmax(szTag));
+
+    new players[32], num;
+    get_players(players, num, "ch");
+
+    new szEntry[64], szName[32], szTier[16], szMessage[256];
+    new count;
+
+    for (new i = 0; i < num; i++)
+    {
+        new pid = players[i];
+        if (g_Tier[pid] < TIER_CHAT)
+            continue;
+
+        get_user_name(pid, szName, charsmax(szName));
+        TierName(g_Tier[pid], szTier, charsmax(szTier));
+        formatex(szEntry, charsmax(szEntry), "^4%s^1 (^3%s^1)", szName, szTier);
+
+        if (!count)
+            copy(szMessage, charsmax(szMessage), szEntry);
+        else
+            format(szMessage, charsmax(szMessage), "%s, %s", szMessage, szEntry);
+
+        count++;
+    }
+
+    if (!count)
+        client_print_color(id, print_team_default, "^3[%s] ^1There are no ^4VIPs ^1online.", szTag);
+    else
+        client_print_color(id, print_team_default, "^3[%s] ^1VIPs Online: %s", szTag, szMessage);
+}
+
+// ============================================================
+// VIP CENTER (/vip)
+// ============================================================
+ShowVipCenter(id)
+{
+    if (!is_user_connected(id))
+        return;
+
+    new szTier[16], szStatus[16], szExpire[32], szTitle[192], szArmory[96];
+    TierName(g_Tier[id], szTier, charsmax(szTier));
+
+    if (g_Tier[id] >= FNVIP_VIP)
+        copy(szStatus, charsmax(szStatus), "Active");
+    else
+        copy(szStatus, charsmax(szStatus), "Member");
+
+    if (!g_bValid[id])
+        copy(szExpire, charsmax(szExpire), "Loading");
+    else if (g_Tier[id] < FNVIP_VIP)
+        copy(szExpire, charsmax(szExpire), "-");
+    else if (g_EntTier[id] >= g_StaticTier[id] && g_EntExpire[id] > 0)
+        FormatDuration(g_EntExpire[id] - get_systime(), szExpire, charsmax(szExpire));
+    else
+        copy(szExpire, charsmax(szExpire), "Permanent");
+
+    new szBase[96];
+    FN_MenuTitle(szBase, charsmax(szBase), "VIP Center");
+    formatex(szTitle, charsmax(szTitle), "%s^n\wTier: \y%s  \wStatus: \y%s^n\wExpires: \y%s", szBase, szTier, szStatus, szExpire);
+
+    ArmoryMenuLabel(id, szArmory, charsmax(szArmory));
+
+    new menu = menu_create(szTitle, "Handle_VipCenter");
+    menu_additem(menu, "Benefits", "1");
+    menu_additem(menu, szArmory, "2");
+    menu_additem(menu, "Online VIPs", "3");
+    FN_MenuFinish(menu, false);
+    menu_setprop(menu, MPROP_PERPAGE, 0);
+    menu_display(id, menu);
+}
+
+ArmoryMenuLabel(id, out[], len)
+{
+    if (!ArmoryAccess(id))
+    {
+        formatex(out, len, "VIP Weapons \d[LOCKED - VIP+ / BP Weapon Menu]");
+        return;
+    }
+    if (IsWarmupRunning())
+    {
+        formatex(out, len, "VIP Weapons \d[Warmup]");
+        return;
+    }
+    if (CurrentRound <= 1)
+    {
+        formatex(out, len, "VIP Weapons \d[Pistol round]");
+        return;
+    }
+    if (g_Use[id])
+    {
+        formatex(out, len, "VIP Weapons \d[Already used this round]");
+        return;
+    }
+    if (!g_MenuOK[id] || get_pcvar_num(g_pMode) == 0)
+    {
+        formatex(out, len, "VIP Weapons \d[Unavailable]");
+        return;
+    }
+    formatex(out, len, "VIP Weapons \y[Available]");
+}
+
+public Handle_VipCenter(id, menu, item)
+{
+    if (item == MENU_EXIT)
+    {
+        menu_destroy(menu);
+        return PLUGIN_HANDLED;
+    }
+
+    new data[6], access, callback, name[64];
+    menu_item_getinfo(menu, item, access, data, charsmax(data), name, charsmax(name), callback);
+    new iChoice = str_to_num(data);
+    menu_destroy(menu);
+
+    if (!is_user_connected(id))
+        return PLUGIN_HANDLED;
+
+    switch (iChoice)
+    {
+        case 1:
+            ShowVipMotd(id);
+        case 2:
+        {
+            if (!ArmoryAccess(id))
+            {
+                new szTag[16], szStatus[16];
+                GetVipTag(szTag, charsmax(szTag));
+                TierName(g_Tier[id], szStatus, charsmax(szStatus));
+                VipChat(id, "^3[%s] ^1The VIP Armory requires ^4VIP+^1 or the ^3BattlePass Weapon Menu^1 (your status: ^3%s^1).", szTag, szStatus);
+                ShowVipCenter(id);
+                return PLUGIN_HANDLED;
+            }
+            Cmd_VMenu(id);
+        }
+        case 3:
+            ShowVipsList(id);
+    }
+    return PLUGIN_HANDLED;
+}
+
+// ============================================================
+// SPAWN & ROUND EVENTS
+// ============================================================
+bool:IsWarmupRunning()
+{
+    // simple_warmup.sma exposes this cvar
+    return (get_cvar_num("amx_knife_round_active") == 1) ? true : false;
+}
+
+public Event_NewRound()
+{
+    CloseAllPlayerMenus();
+
+    if (IsWarmupRunning())
+    {
+        CurrentRound = 0;
+        return;
+    }
+
+    CurrentRound++;
+
+    for (new i = 1; i <= MaxClients; i++)
+        g_Use[i] = false;
+}
+
+public Event_RoundRestart()
+{
+    CurrentRound = 0;
+
+    for (new i = 1; i <= MaxClients; i++)
+        g_Use[i] = false;
+}
+
+public Event_RoundEnd()
+{
+    CloseAllPlayerMenus();
+}
+
+CloseAllPlayerMenus()
+{
+    for (new i = 1; i <= MaxClients; i++)
+    {
+        if (is_user_connected(i))
+        {
+            show_menu(i, 0, "^n", 1);
+            menu_cancel(i);
+        }
+    }
+}
+
+public OnPlayerSpawn(id)
+{
+    if (!is_user_alive(id))
+        return HAM_IGNORED;
+
+    if (IsWarmupRunning())
+        return HAM_IGNORED;
+
+    // Defuse kit is a tier-1 (VIP) perk - gate it independently of the
+    // spawn-bonus block below (VIP+)
+    if (g_Tier[id] >= TIER_DEFUSEKIT && get_pcvar_num(g_pDefuseKit) == 1 && cs_get_user_team(id) == CS_TEAM_CT)
+        give_item(id, "item_thighpack");
+
+    if (g_Tier[id] < TIER_SPAWN)
+    {
+        ResetModel(id); // no-ops for non-model players; clears stale models
+        return HAM_IGNORED;
+    }
+
+    g_MenuOK[id] = !g_bMapRestricted;
+
+    if (get_pcvar_num(g_pMode) == 2 && g_MenuOK[id] && !g_Use[id] && ArmoryAccess(id))
+        set_task(0.5, "Task_AutoOpenMenu", id + TASK_MENU);
+
+    // BattlePass owns spawn armor (it applies 0.2s after spawn for any VIP).
+    // Do not give_item assaultsuit / set_user_armor here - that overwrites BP.
+    cs_set_user_money(id, clamp(cs_get_user_money(id) + get_pcvar_num(g_pStartMoney), 0, 16000));
+
+    ResetModel(id);
+
+    return HAM_IGNORED;
+}
+
+public Task_AutoOpenMenu(taskid)
+{
+    new id = taskid - TASK_MENU;
+    if (!is_user_alive(id) || !is_user_connected(id))
+        return;
+
+    if (!ArmoryAccess(id))
+        return;
+
+    if (IsWarmupRunning())
+        return;
+
+    if (!g_MenuOK[id] || g_Use[id])
+        return;
+
+    Cmd_VMenu(id);
+}
+
+public OnResetHud(id)
+{
+    ResetModel(id);
+
+    if (get_pcvar_num(g_pTab) == 1)
+        set_task(0.5, "Task_SetVipTab", id + TASK_VIPTAB);
+}
+
+public Task_SetVipTab(TaskID)
+{
+    new id = TaskID - TASK_VIPTAB;
+
+    if (is_user_connected(id) && g_Tier[id] >= TIER_TAB)
+    {
+        message_begin(MSG_ALL, get_user_msgid("ScoreAttrib"));
+        write_byte(id);
+        write_byte(4);
+        message_end();
+    }
+}
+
+bool:AwpUnlocked(id)
+{
+    if (!LibraryExists("menabp", LibType_Library))
+        return false;
+    return bool:menabp_has_weapon_menu_awp(id);
+}
+
+public VipAwpItemCallback(id, menu, item)
+{
+    return ITEM_DISABLED;
+}
+
+// ============================================================
+// VIP ARMORY
+// ============================================================
+// BattlePass weapon-menu holders share the single armory surface. The legacy
+// weaponmenu.sma plugin is gated off by fn_weaponmenu_enabled 0 (default), so
+// exactly ONE gun menu is reachable: this armory serves VIP+ AND holders.
+bool:HasBattlePassWeaponMenu(id)
+{
+    if (!LibraryExists("menabp", LibType_Library))
+        return false;
+    return bool:menabp_has_weapon_menu(id);
+}
+
+bool:ArmoryAccess(id)
+{
+    if (g_Tier[id] >= TIER_ARMORY)
+        return true;
+    return HasBattlePassWeaponMenu(id);
+}
+
+// Opening the menu is not authorization. Re-check on every click:
+// connected, alive, VIP+, not warmup, map allowed, unused this round,
+// and CurrentRound still matches the menu that was opened.
+bool:ArmoryCanTake(id, iNeedRound)
+{
+    new szTag[16];
+    GetVipTag(szTag, charsmax(szTag));
+
+    if (!is_user_connected(id))
+        return false;
+    if (!is_user_alive(id))
+    {
+        VipChat(id, "^3[%s] ^1You must be ^3alive^1 to use the VIP Menu.", szTag);
+        return false;
+    }
+    if (!ArmoryAccess(id))
+    {
+        VipChat(id, "^3[%s] ^1VIP Armory expired. ^4VIP+^1 or the BattlePass Weapon Menu required.", szTag);
+        return false;
+    }
+    if (IsWarmupRunning())
+    {
+        VipChat(id, "^3[%s] ^1VIP Menu is ^3disabled^1 during the knife warmup round.", szTag);
+        return false;
+    }
+    if (!g_MenuOK[id])
+    {
+        VipChat(id, "^3[%s] ^1VIP Menu is disabled on this map.", szTag);
+        return false;
+    }
+    if (g_Use[id])
+    {
+        VipChat(id, "^3[%s] ^1You already used your weapon menu this round.", szTag);
+        return false;
+    }
+    if (iNeedRound == 2 && CurrentRound != 2)
+    {
+        VipChat(id, "^3[%s] ^1That loadout is no longer valid this round.", szTag);
+        return false;
+    }
+    if (iNeedRound >= 3 && CurrentRound < 3)
+    {
+        VipChat(id, "^3[%s] ^1That loadout is no longer valid this round.", szTag);
+        return false;
+    }
+    if (iNeedRound == 0 && CurrentRound < 1)
+    {
+        VipChat(id, "^3[%s] ^1That loadout is no longer valid this round.", szTag);
+        return false;
+    }
+    return true;
+}
+
+GiveVIPBaseEquipment(id)
+{
+    StripWeapons(id, Primary);
+    StripWeapons(id, Secondary);
+    // the player already spawns with a knife - giving another appends a
+    // duplicate knife entity (classic dual-knife glitch)
+    give_item(id, "item_assaultsuit");
+    give_item(id, "weapon_hegrenade");
+    give_item(id, "weapon_flashbang");
+    cs_set_user_bpammo(id, CSW_FLASHBANG, 2);
+    if (cs_get_user_team(id) == CS_TEAM_CT && get_pcvar_num(g_pDefuseKit) == 1)
+        give_item(id, "item_thighpack");
+}
+
+GivePistolByNum(id, iChoice)
+{
+    switch (iChoice)
+    {
+        case 1: { give_item(id, "weapon_deagle");  cs_set_user_bpammo(id, CSW_DEAGLE, 35); }
+        case 2: { give_item(id, "weapon_usp");     cs_set_user_bpammo(id, CSW_USP, 100); }
+        case 3: { give_item(id, "weapon_glock18"); cs_set_user_bpammo(id, CSW_GLOCK18, 120); }
+        default: { give_item(id, "weapon_deagle"); cs_set_user_bpammo(id, CSW_DEAGLE, 35); }
+    }
+}
+
+ShowRound2Menu(id)
+{
+    new szTitle[128];
+    new szBase[64];
+    FN_MenuTitle(szBase, charsmax(szBase), "VIP Armory");
+    formatex(szTitle, charsmax(szTitle), "%s^n\wRound 2 Loadout", szBase);
+
+    new menu = menu_create(szTitle, "Handle_Round2Menu");
+
+    menu_additem(menu, "\wFamas", "1");
+    menu_additem(menu, "\wGalil", "2");
+    menu_additem(menu, "\wScout^n\d------------------", "3");
+    menu_additem(menu, "\r[+] \wChange Pistol^n\d------------------", "4");
+
+    FN_MenuFinish(menu, false);
+    menu_display(id, menu);
+}
+
+public Handle_Round2Menu(id, menu, item)
+{
+    if (item == MENU_EXIT)
+    {
+        menu_destroy(menu);
+        return PLUGIN_HANDLED;
+    }
+
+    if (!ArmoryCanTake(id, 2))
+    {
+        menu_destroy(menu);
+        return PLUGIN_HANDLED;
+    }
+
+    new data[6], access, callback, name[64];
+    menu_item_getinfo(menu, item, access, data, charsmax(data), name, charsmax(name), callback);
+    new iChoice = str_to_num(data);
+    menu_destroy(menu);
+
+    if (iChoice == 4)
+    {
+        g_iPrimaryChoice[id] = 0;
+        ShowPistolMenu(id);
+        return PLUGIN_HANDLED;
+    }
+
+    new szTag[16];
+    GetVipTag(szTag, charsmax(szTag));
+
+    if (g_iSavedPistol[id] > 0)
+    {
+        g_Use[id] = true;
+        GiveVIPBaseEquipment(id);
+
+        switch (iChoice)
+        {
+            case 1: { give_item(id, "weapon_famas"); cs_set_user_bpammo(id, CSW_FAMAS, 90); }
+            case 2: { give_item(id, "weapon_galil"); cs_set_user_bpammo(id, CSW_GALIL, 90); }
+            case 3: { give_item(id, "weapon_scout"); cs_set_user_bpammo(id, CSW_SCOUT, 90); }
+        }
+
+        GivePistolByNum(id, g_iSavedPistol[id]);
+        VipChat(id, "^3[%s] ^1Granted primary weapon + saved ^3%s^1!", szTag, g_szPistolNames[g_iSavedPistol[id]]);
+    }
+    else
+    {
+        g_iPrimaryChoice[id] = iChoice;
+        ShowPistolMenu(id);
+    }
+
+    return PLUGIN_HANDLED;
+}
+
+ShowRound3Menu(id)
+{
+    new szTitle[128];
+    new szBase[64];
+    FN_MenuTitle(szBase, charsmax(szBase), "VIP Armory");
+    formatex(szTitle, charsmax(szTitle), "%s^n\wSelect your weapon", szBase);
+
+    new menu = menu_create(szTitle, "Handle_Round3Menu");
+
+    menu_additem(menu, "\wAK-47", "1");
+    menu_additem(menu, "\wM4A1",  "2");
+    if (AwpUnlocked(id))
+        menu_additem(menu, "\wAWP \d(30 Ammo)^n\d------------------", "3");
+    else
+        menu_additem(menu, "\dAWP \r(LOCKED)", "3", 0, menu_makecallback("VipAwpItemCallback"));
+    menu_additem(menu, "\r[+] \wChange Pistol^n\d------------------", "4");
+
+    FN_MenuFinish(menu, false);
+    menu_display(id, menu);
+}
+
+public Handle_Round3Menu(id, menu, item)
+{
+    if (item == MENU_EXIT)
+    {
+        menu_destroy(menu);
+        return PLUGIN_HANDLED;
+    }
+
+    if (!ArmoryCanTake(id, 3))
+    {
+        menu_destroy(menu);
+        return PLUGIN_HANDLED;
+    }
+
+    new data[6], access, callback, name[64];
+    menu_item_getinfo(menu, item, access, data, charsmax(data), name, charsmax(name), callback);
+    new iChoice = str_to_num(data);
+    menu_destroy(menu);
+
+    if (iChoice == 4)
+    {
+        g_iPrimaryChoice[id] = 0;
+        ShowPistolMenu(id);
+        return PLUGIN_HANDLED;
+    }
+
+    new szTag[16];
+    GetVipTag(szTag, charsmax(szTag));
+
+    if (iChoice == 3 && !AwpUnlocked(id))
+    {
+        VipChat(id, "^3[%s] ^1AWP is locked. Unlock it on your BattlePass track (/bp).", szTag);
+        ShowRound3Menu(id);
+        return PLUGIN_HANDLED;
+    }
+
+    if (g_iSavedPistol[id] > 0)
+    {
+        g_Use[id] = true;
+        GiveVIPBaseEquipment(id);
+
+        switch (iChoice)
+        {
+            case 1: { give_item(id, "weapon_ak47"); cs_set_user_bpammo(id, CSW_AK47, 90); }
+            case 2: { give_item(id, "weapon_m4a1"); cs_set_user_bpammo(id, CSW_M4A1, 90); }
+            case 3:
+            {
+                give_item(id, "weapon_awp");
+                cs_set_user_bpammo(id, CSW_AWP, 30);
+            }
+        }
+
+        GivePistolByNum(id, g_iSavedPistol[id]);
+        VipChat(id, "^3[%s] ^1Granted primary weapon + saved ^3%s^1!", szTag, g_szPistolNames[g_iSavedPistol[id]]);
+    }
+    else
+    {
+        g_iPrimaryChoice[id] = iChoice;
+        ShowPistolMenu(id);
+    }
+
+    return PLUGIN_HANDLED;
+}
+
+ShowPistolMenu(id)
+{
+    new szTitle[128], szBase[64];
+    FN_MenuTitle(szBase, charsmax(szBase), "VIP Armory");
+    if (g_iSavedPistol[id] > 0)
+        formatex(szTitle, charsmax(szTitle), "%s^n\wSelect Pistol \d(Saved: \y%s\d)", szBase, g_szPistolNames[g_iSavedPistol[id]]);
+    else
+        formatex(szTitle, charsmax(szTitle), "%s^n\wSelect Pistol", szBase);
+
+    new menu = menu_create(szTitle, "Handle_PistolMenu");
+
+    menu_additem(menu, "\wDesert Eagle", "1");
+    menu_additem(menu, "\wUSP",          "2");
+    menu_additem(menu, "\wGlock-18^n\d------------------", "3");
+
+    FN_MenuFinish(menu, false);
+    menu_display(id, menu);
+}
+
+public Handle_PistolMenu(id, menu, item)
+{
+    if (item == MENU_EXIT)
+    {
+        menu_destroy(menu);
+        return PLUGIN_HANDLED;
+    }
+
+    if (!ArmoryCanTake(id, 0))
+    {
+        menu_destroy(menu);
+        return PLUGIN_HANDLED;
+    }
+
+    new data[6], access, callback, name[64];
+    menu_item_getinfo(menu, item, access, data, charsmax(data), name, charsmax(name), callback);
+    new iChoice = str_to_num(data);
+    menu_destroy(menu);
+
+    new szTag[16];
+    GetVipTag(szTag, charsmax(szTag));
+
+    if (g_iPrimaryChoice[id] == 0 && CurrentRound > 1)
+    {
+        g_iSavedPistol[id] = iChoice;
+        VipChat(id, "^3[%s] ^1Saved ^3%s^1 for future rounds!", szTag, g_szPistolNames[iChoice]);
+
+        if (CurrentRound == 2)
+            ShowRound2Menu(id);
+        else
+            ShowRound3Menu(id);
+
+        return PLUGIN_HANDLED;
+    }
+
+    if (g_iPrimaryChoice[id] == 3 && CurrentRound >= 3 && !AwpUnlocked(id))
+    {
+        VipChat(id, "^3[%s] ^1AWP is locked. Unlock it on your BattlePass track (/bp).", szTag);
+        ShowRound3Menu(id);
+        return PLUGIN_HANDLED;
+    }
+
+    g_Use[id] = true;
+    g_iSavedPistol[id] = iChoice;
+
+    GiveVIPBaseEquipment(id);
+
+    if (CurrentRound > 1)
+    {
+        switch (g_iPrimaryChoice[id])
+        {
+            case 1:
+            {
+                if (CurrentRound == 2) { give_item(id, "weapon_famas"); cs_set_user_bpammo(id, CSW_FAMAS, 90); }
+                else                   { give_item(id, "weapon_ak47");  cs_set_user_bpammo(id, CSW_AK47, 90); }
+            }
+            case 2:
+            {
+                if (CurrentRound == 2) { give_item(id, "weapon_galil"); cs_set_user_bpammo(id, CSW_GALIL, 90); }
+                else                   { give_item(id, "weapon_m4a1");  cs_set_user_bpammo(id, CSW_M4A1, 90); }
+            }
+            case 3:
+            {
+                if (CurrentRound == 2) { give_item(id, "weapon_scout"); cs_set_user_bpammo(id, CSW_SCOUT, 90); }
+                else
+                {
+                    give_item(id, "weapon_awp");
+                    cs_set_user_bpammo(id, CSW_AWP, 30);
+                }
+            }
+        }
+    }
+
+    GivePistolByNum(id, iChoice);
+    VipChat(id, "^3[%s] ^1Saved ^3%s^1 for future rounds!", szTag, g_szPistolNames[iChoice]);
+
+    return PLUGIN_HANDLED;
+}
+
+// ============================================================
+// KILL BONUSES (VIP) & DAMAGE HUD (VIP+)
+// ============================================================
+public client_death(killer, victim, weapon, hitplace, TK)
+{
+    if (!is_user_connected(killer) || !is_user_connected(victim) || IsWarmupRunning())
+        return;
+
+    // No kill bonuses for teamkills or bot victims (same policy as CRX)
+    if (killer == victim || TK || g_Tier[killer] < TIER_KILLBONUS)
+        return;
+
+    if (is_user_bot(victim) || is_user_hltv(victim))
+        return;
+
+    new VIP_MAXAP = get_pcvar_num(g_pMaxAP);
+    new VIP_AP = get_user_armor(killer);
+
+    if (!(hitplace == HIT_HEAD) && !(weapon == CSW_KNIFE))
+    {
+        // Free kill HP removed: earned via BattlePass Vampire skill
+        if (VIP_AP + get_pcvar_num(g_pAPKill) >= VIP_MAXAP) set_user_armor(killer, VIP_MAXAP);
+        else set_user_armor(killer, VIP_AP + get_pcvar_num(g_pAPKill));
+
+        cs_set_user_money(killer, clamp(cs_get_user_money(killer) + get_pcvar_num(g_pMoneyKill), 0, 16000));
+    }
+
+    if (hitplace == HIT_HEAD && !(weapon == CSW_KNIFE))
+    {
+        if (VIP_AP + get_pcvar_num(g_pAPHs) >= VIP_MAXAP) set_user_armor(killer, VIP_MAXAP);
+        else set_user_armor(killer, VIP_AP + get_pcvar_num(g_pAPHs));
+
+        cs_set_user_money(killer, clamp(cs_get_user_money(killer) + get_pcvar_num(g_pMoneyHS), 0, 16000));
+    }
+
+    if (weapon == CSW_KNIFE && !(hitplace == HIT_HEAD))
+    {
+        if (VIP_AP + get_pcvar_num(g_pAPKillKnife) >= VIP_MAXAP) set_user_armor(killer, VIP_MAXAP);
+        else set_user_armor(killer, VIP_AP + get_pcvar_num(g_pAPKillKnife));
+
+        cs_set_user_money(killer, clamp(cs_get_user_money(killer) + get_pcvar_num(g_pMoneyKill), 0, 16000));
+    }
+
+    if (weapon == CSW_KNIFE && (hitplace == HIT_HEAD))
+    {
+        if (VIP_AP + get_pcvar_num(g_pAPHsKnife) >= VIP_MAXAP) set_user_armor(killer, VIP_MAXAP);
+        else set_user_armor(killer, VIP_AP + get_pcvar_num(g_pAPHsKnife));
+
+        cs_set_user_money(killer, clamp(cs_get_user_money(killer) + get_pcvar_num(g_pMoneyHS), 0, 16000));
+    }
+}
+
+public client_damage(iAttacker, iVictim, iDamage)
+{
+    if (!is_user_connected(iAttacker) || g_Tier[iAttacker] < TIER_BULLETDMG)
+        return;
+
+    if (iAttacker == iVictim)
+        return;
+
+    if (get_pcvar_num(g_pBulletDmg) != 1)
+        return;
+
+    if (!fnpref_is_loaded(iAttacker) || fnpref_get(iAttacker, FNPREF_DAMAGE_HUD) == 0)
+        return;
+
+    // Mode 5 (default): modern near-crosshair design - a mix of the "with
+    // icon" ring placement and the modern minimal style: number sits just
+    // under the crosshair, rotates through 8 tight offsets to avoid overlap,
+    // in a fixed FreeNova green (no random colors). Red flash for headshots.
+    if (get_pcvar_num(g_pBulletDmgMode) == 5)
+    {
+        if (++g_iPosition[iAttacker] == g_iHudSize)
+            g_iPosition[iAttacker] = 0;
+
+        // tight ring right around the crosshair (modern offset style)
+        static const Float:flModern[8][2] =
+        {
+            { 0.500, 0.545 }, { 0.530, 0.530 }, { 0.545, 0.500 }, { 0.530, 0.470 },
+            { 0.500, 0.455 }, { 0.470, 0.470 }, { 0.455, 0.500 }, { 0.470, 0.530 }
+        };
+
+        new iR = 120, iG = 255, iB = 22;   // FreeNova neon green
+
+        // color-code by damage size (minimal, no random colors):
+        // heavy hit = warning amber, medium = white, light = green
+        if (iDamage >= 60)
+        {
+            iR = 241; iG = 196; iB = 15;   // fn-warning for heavy hits
+        }
+        else if (iDamage >= 30)
+        {
+            iR = 232; iG = 236; iB = 232;  // white for medium
+        }
+
+        set_hudmessage(iR, iG, iB, flModern[g_iPosition[iAttacker]][0], flModern[g_iPosition[iAttacker]][1], 0, 0.0, 1.2, 0.0, 0.0, -1);
+        show_hudmessage(iAttacker, "%i", iDamage);
+        return;
+    }
+
+    if (get_pcvar_num(g_pBulletDmgMode) == 1)
+    {
+        if (++g_iPosition[iAttacker] == g_iHudSize)
+            g_iPosition[iAttacker] = 0;
+
+        set_hudmessage(random_num(0, 255), random_num(0, 255), random_num(0, 255), g_flCoords[g_iPosition[iAttacker]][0], g_flCoords[g_iPosition[iAttacker]][1], 0, 0.1, 2.5, 0.02, 0.02, -1);
+        show_hudmessage(iAttacker, "%i", iDamage);
+    }
+    else if (get_pcvar_num(g_pBulletDmgMode) == 2)
+    {
+        if (++g_iPosition[iAttacker] == g_iHudSize)
+            g_iPosition[iAttacker] = 0;
+
+        if (cs_get_user_team(iAttacker) == CS_TEAM_CT)
+        {
+            set_hudmessage(42, 170, 255, g_flCoords[g_iPosition[iAttacker]][0], g_flCoords[g_iPosition[iAttacker]][1], 0, 0.1, 2.5, 0.02, 0.02, -1);
+            show_hudmessage(iAttacker, "%i", iDamage);
+        }
+        else if (cs_get_user_team(iAttacker) == CS_TEAM_T)
+        {
+            set_hudmessage(200, 0, 0, g_flCoords[g_iPosition[iAttacker]][0], g_flCoords[g_iPosition[iAttacker]][1], 0, 0.1, 2.5, 0.02, 0.02, -1);
+            show_hudmessage(iAttacker, "%i", iDamage);
+        }
+    }
+    else if (get_pcvar_num(g_pBulletDmgMode) == 3)
+    {
+        set_hudmessage(random_num(0, 255), random_num(0, 255), random_num(0, 255), -1.0, 0.5, 0, 0.0, 0.1, 0.1, 0.1);
+        show_hudmessage(iAttacker, "%i", iDamage);
+    }
+    else if (get_pcvar_num(g_pBulletDmgMode) == 4)
+    {
+        if (cs_get_user_team(iAttacker) == CS_TEAM_CT)
+        {
+            set_hudmessage(42, 170, 255, -1.0, 0.5, 0, 0.0, 0.1, 0.1, 0.1);
+            show_hudmessage(iAttacker, "%i", iDamage);
+        }
+        else if (cs_get_user_team(iAttacker) == CS_TEAM_T)
+        {
+            set_hudmessage(200, 0, 0, -1.0, 0.5, 0, 0.0, 0.1, 0.1, 0.1);
+            show_hudmessage(iAttacker, "%i", iDamage);
+        }
+    }
+}
+
+// ============================================================
+// MODELS (VIP+; admin model takes precedence)
+// ============================================================
+ResetModel(id)
+{
+    #pragma unused id
+    // Model application is handled centrally by weapon_models authority
+    // (avoids model stacking and race conditions on spawn)
+    return;
+}
+
+// ============================================================
+// CHAT HELPERS
+// ============================================================
+bool:IsChatCommand(const szMessage[])
+{
+    new i = 0;
+    while (szMessage[i] == ' ' || szMessage[i] == '^t')
+        i++;
+
+    switch (szMessage[i])
+    {
+        case EOS, '/', '!', '.', ',', '@', '#':
+            return true;
+    }
+
+    return false;
+}
+
+bool:CanPlayerHearChat(iSender, iReceiver, bool:bIsTeam)
+{
+    if (iSender == iReceiver)
+        return true;
+
+    if (!is_user_connected(iReceiver))
+        return false;
+
+    new CsTeams:iSenderTeam = cs_get_user_team(iSender);
+    new CsTeams:iReceiverTeam = cs_get_user_team(iReceiver);
+
+    if (bIsTeam && (iSenderTeam != iReceiverTeam))
+        return false;
+
+    if (get_cvar_num("sv_alltalk"))
+        return true;
+
+    new bool:bSenderAlive = bool:is_user_alive(iSender);
+    new bool:bReceiverAlive = bool:is_user_alive(iReceiver);
+
+    if (!bSenderAlive && bReceiverAlive)
+        return false;
+
+    return true;
+}
+
+SendSayText(iSender, iReceiver, const szMessage[])
+{
+    static iMsgSayText = 0;
+    if (!iMsgSayText)
+        iMsgSayText = get_user_msgid("SayText");
+
+    message_begin(MSG_ONE, iMsgSayText, _, iReceiver);
+    write_byte(iSender);
+    write_string(szMessage);
+    message_end();
+}
+
+GetVipTag(out[], len)
+{
+    get_pcvar_string(g_pTag, out, len);
+    trim(out);
+    if (!out[0])
+        copy(out, len, "VIP");
+}
+
+TierTag(id, out[], len)
+{
+    // Tier name as the tag when enabled, else the generic vip_tag
+    if (get_pcvar_num(g_pTierTags) == 1 && g_Tier[id] != FNVIP_NONE)
+    {
+        TierName(g_Tier[id], out, len);
+        return;
+    }
+    GetVipTag(out, len);
+}
+
+stock VipChat(id, const szMessage[], any:...)
+{
+    static szBuffer[192];
+    vformat(szBuffer, charsmax(szBuffer), szMessage, 3);
+    client_print_color(id, print_team_default, "%s", szBuffer);
+}
+
+// ============================================================
+// INTERNAL GRANT/REVOKE
+// ============================================================
+bool:fnGrant(id, tier, seconds, source, reason[] = "")
+{
+    if (!g_bValid[id] || tier < FNVIP_VIP || tier > FNVIP_ELITE || seconds <= 0)
+        return false;
+
+    new szKey[80], szVal[24];
+    formatex(szKey, charsmax(szKey), "ent#%s#%d#%d", g_szAuth[id], tier, source);
+
+    new now = get_systime();
+    new expire = now + seconds;
+
+    new ts, szOld[24];
+    if (nvault_lookup(g_Vault, szKey, szOld, charsmax(szOld), ts))
+    {
+        new oldExpire = str_to_num(szOld);
+        if (oldExpire > now)
+            expire = oldExpire + seconds; // extend (spec §13 option)
+        // if already expired, fall through to fresh grant
+    }
+
+    formatex(szVal, charsmax(szVal), "%d", expire);
+    nvault_set(g_Vault, szKey, szVal);
+
+    if (reason[0] && get_pcvar_num(g_pDebug))
+        log_amx("[FreeNova VIP] grant %s tier=%d src=%d expire=%d (%s)", g_szAuth[id], tier, source, expire, reason);
+
+    RecheckPlayer(id);
+    return true;
+}
+
+RevokeKey(id, tier, source)
+{
+    if (!g_bValid[id])
+        return;
+
+    new szKey[80];
+    formatex(szKey, charsmax(szKey), "ent#%s#%d#%d", g_szAuth[id], tier, source);
+    nvault_remove(g_Vault, szKey);
+}
+
+// ============================================================
+// NATIVE IMPLEMENTATIONS
+// ============================================================
+public _get_tier(plugin, params)
+{
+    new id = get_param(1);
+    if (!IsReady(id))
+        return FNVIP_NONE;
+    return g_Tier[id];
+}
+
+public _has_tier(plugin, params)
+{
+    new id = get_param(1);
+    new tier = get_param(2);
+    if (!IsReady(id))
+        return 0;
+    return (g_Tier[id] >= tier) ? 1 : 0;
+}
+
+public _has_benefit(plugin, params)
+{
+    new id = get_param(1);
+    new benefit = get_param(2);
+    if (!IsReady(id))
+        return 0;
+
+    switch (benefit)
+    {
+        case FNVIP_BENEFIT_XP, FNVIP_BENEFIT_BPXP, FNVIP_BENEFIT_COINS,
+             FNVIP_BENEFIT_CHATTAG, FNVIP_BENEFIT_BADGE, FNVIP_BENEFIT_TRIALS:
+            return (g_Tier[id] >= FNVIP_VIP) ? 1 : 0;
+        case FNVIP_BENEFIT_WEAPONS, FNVIP_BENEFIT_MODELS, FNVIP_BENEFIT_SKINS,
+             FNVIP_BENEFIT_PERKS:
+            return (g_Tier[id] >= FNVIP_VIPPLUS) ? 1 : 0;
+    }
+    return 0;
+}
+
+public Float:_get_xp_mult(plugin, params)
+{
+    new id = get_param(1);
+    new tier = IsReady(id) ? g_Tier[id] : FNVIP_NONE;
+    if (tier < FNVIP_VIP)
+        return 1.0;
+    return get_pcvar_float(g_pMultXP[tier]);
+}
+
+public Float:_get_bp_mult(plugin, params)
+{
+    new id = get_param(1);
+    new tier = IsReady(id) ? g_Tier[id] : FNVIP_NONE;
+    if (tier < FNVIP_VIP)
+        return 1.0;
+    return get_pcvar_float(g_pMultBP[tier]);
+}
+
+public Float:_get_coin_mult(plugin, params)
+{
+    new id = get_param(1);
+    new tier = IsReady(id) ? g_Tier[id] : FNVIP_NONE;
+    if (tier < FNVIP_VIP)
+        return 1.0;
+    return get_pcvar_float(g_pMultCoin[tier]);
+}
+
+public _get_tier_name(plugin, params)
+{
+    new id = get_param(1);
+    new out[16], len = get_param(3);
+    TierName(IsReady(id) ? g_Tier[id] : FNVIP_NONE, out, charsmax(out));
+    set_string(2, out, len);
+    return 1;
+}
+
+public _get_tier_name_raw(plugin, params)
+{
+    new out[16], len = get_param(2);
+    TierName(get_param(1), out, charsmax(out));
+    set_string(2, out, len);
+    return 1;
+}
+
+public _grant(plugin, params)
+{
+    new id = get_param(1);
+    new tier = get_param(2);
+    new seconds = get_param(3);
+    new source = get_param(4);
+
+    new reason[32];
+    if (params >= 5)
+        get_string(5, reason, charsmax(reason));
+
+    if (!IsReady(id))
+        return 0;
+
+    return fnGrant(id, tier, seconds, source, reason) ? 1 : 0;
+}
+
+public _revoke(plugin, params)
+{
+    new id = get_param(1);
+    new tier = get_param(2);
+    new source = get_param(3);
+
+    if (!IsReady(id))
+        return 0;
+
+    if (tier == -1)
+    {
+        for (new t = FNVIP_VIP; t <= FNVIP_ELITE; t++)
+        {
+            if (source == -1)
+            {
+                for (new s = 0; s < MAX_ENT_SOURCES; s++)
+                    RevokeKey(id, t, s);
+            }
+            else
+                RevokeKey(id, t, source);
+        }
+    }
+    else if (tier >= FNVIP_VIP && tier <= FNVIP_ELITE)
+    {
+        if (source == -1)
+        {
+            for (new s = 0; s < MAX_ENT_SOURCES; s++)
+                RevokeKey(id, tier, s);
+        }
+        else
+            RevokeKey(id, tier, source);
+    }
+
+    RecheckPlayer(id);
+    return 1;
+}
+
+public _get_remaining(plugin, params)
+{
+    new id = get_param(1);
+    if (!IsReady(id) || g_Tier[id] == FNVIP_NONE)
+        return 0;
+
+    if (g_EntTier[id] >= g_StaticTier[id] && g_EntExpire[id] > 0)
+        return g_EntExpire[id] - get_systime();
+
+    // Night Free VIP is an event overlay, not a permanent flag.
+    if (g_bFreeVipGranted[id] && g_StaticTier[id] < FNVIP_VIP && g_EntTier[id] < FNVIP_VIP)
+        return 0;
+
+    return -1; // static flag VIP - no expiry
+}
+
+public _claim_trial(plugin, params)
+{
+    new id = get_param(1);
+    if (!IsReady(id))
+        return -1;
+
+    new szKey[80];
+    formatex(szKey, charsmax(szKey), "regtrial#%s", g_szAuth[id]);
+
+    new ts, szVal[24];
+    if (nvault_lookup(g_Vault, szKey, szVal, charsmax(szVal), ts))
+        return 0; // already claimed - the vault key IS the one-time lock
+
+    // AMXX game logic is single-threaded: lookup+write completes within
+    // this call with no yielding, so two callbacks can never interleave.
+    // The persistent key makes the claim survive reconnects and restarts.
+    formatex(szVal, charsmax(szVal), "%d", get_systime());
+    nvault_set(g_Vault, szKey, szVal);
+
+    fnGrant(id, FNVIP_VIPPLUS, REG_TRIAL_SECONDS, FNVIP_SRC_REG_TRIAL, "registration");
+
+    log_amx("[FreeNova VIP] registration trial claimed: %s (VIP+ for 72h)", g_szAuth[id]);
+    return 1;
+}
+
+public _trial_claimed(plugin, params)
+{
+    new id = get_param(1);
+    if (!IsReady(id))
+        return 0;
+    return TrialClaimed(id) ? 1 : 0;
+}
+
+public _resync(plugin, params)
+{
+    new id = get_param(1);
+    if (!IsReady(id))
+        return 0;
+    RecheckPlayer(id);
+    return 1;
+}
+
+public _show_vip_motd(plugin, params)
+{
+    ShowVipMotd(get_param(1));
+    return 1;
+}
+
+public _show_vips_list(plugin, params)
+{
+    ShowVipsList(get_param(1));
+    return 1;
+}
+
+// ============================================================
+// HELPERS
+// ============================================================
+bool:IsReady(id)
+{
+    return (id >= 1 && id <= MaxClients && is_user_connected(id) && g_bValid[id]);
+}
+
+bool:IsRegistered(id)
+{
+    if (!g_bRegPlugin)
+        return false;
+
+    // Optional-provider probe: registration plugin exposes a plain public.
+    // Returns false if the plugin or function is missing.
+    if (callfunc_begin("IsPlayerRegistered", "freenova_registration.amxx") != 1)
+        return false;
+
+    callfunc_push_int(id);
+    new iRet = callfunc_end();
+    return (iRet != 0) ? true : false;
+}
+
+bool:TrialClaimed(id)
+{
+    new szKey[80], ts, szVal[24];
+    formatex(szKey, charsmax(szKey), "regtrial#%s", g_szAuth[id]);
+    return bool:nvault_lookup(g_Vault, szKey, szVal, charsmax(szVal), ts);
+}
+
+TierName(tier, out[], len)
+{
+    switch (tier)
+    {
+        case FNVIP_VIP:     copy(out, len, "VIP");
+        case FNVIP_VIPPLUS: copy(out, len, "VIP+");
+        case FNVIP_ELITE:   copy(out, len, "VIP Elite");
+        default:            copy(out, len, "Member");
+    }
+}
+
+FormatDuration(seconds, out[], len)
+{
+    if (seconds < 0)
+        seconds = 0;
+    new days = seconds / 86400;
+    new hours = (seconds % 86400) / 3600;
+    new mins = (seconds % 3600) / 60;
+    if (days > 0)
+        formatex(out, len, "%dd %dh", days, hours);
+    else if (hours > 0)
+        formatex(out, len, "%dh %dm", hours, mins);
+    else
+        formatex(out, len, "%dm", mins);
+}
+
+// ============================================================
+// WEAPON STRIPPING (classic armory support)
+// ============================================================
+StripWeapons(id, Type, bool:bSwitchIfActive = true)
+{
+    new iReturn;
+
+    if (is_user_alive(id))
+    {
+        new iEntity, iWeapon;
+        while ((iWeapon = GetWeaponFromSlot(id, Type, iEntity)) > 0)
+            iReturn = ham_strip_user_weapon(id, iWeapon, Type, bSwitchIfActive);
+    }
+
+    return iReturn;
+}
+
+GetWeaponFromSlot(id, iSlot, &iEntity)
+{
+    if (!(1 <= iSlot <= 5))
+        return 0;
+
+    iEntity = 0;
+    const m_rgpPlayerItems_Slot0 = 367;
+    const m_iId = 43;
+    const XO_WEAPONS = 4;
+    const XO_PLAYER = 5;
+
+    iEntity = get_pdata_cbase(id, m_rgpPlayerItems_Slot0 + iSlot, XO_PLAYER);
+
+    return (iEntity > 0) ? get_pdata_int(iEntity, m_iId, XO_WEAPONS) : 0;
+}
+
+stock ham_strip_user_weapon(id, iCswId, iSlot = 0, bool:bSwitchIfActive = true)
+{
+    new iWeapon;
+    if (!iSlot)
+    {
+        static const iWeaponsSlots[] = {
+            -1,
+            2, //CSW_P228
+            -1,
+            1, //CSW_SCOUT
+            4, //CSW_HEGRENADE
+            1, //CSW_XM1014
+            5, //CSW_C4
+            1, //CSW_MAC10
+            1, //CSW_AUG
+            4, //CSW_SMOKEGRENADE
+            2, //CSW_ELITE
+            2, //CSW_FIVESEVEN
+            1, //CSW_UMP45
+            1, //CSW_SG550
+            1, //CSW_GALIL
+            1, //CSW_FAMAS
+            2, //CSW_USP
+            2, //CSW_GLOCK18
+            1, //CSW_AWP
+            1, //CSW_MP5NAVY
+            1, //CSW_M249
+            1, //CSW_M3
+            1, //CSW_M4A1
+            1, //CSW_TMP
+            1, //CSW_G3SG1
+            4, //CSW_FLASHBANG
+            2, //CSW_DEAGLE
+            1, //CSW_SG552
+            1, //CSW_AK47
+            3, //CSW_KNIFE
+            1  //CSW_P90
+        };
+        iSlot = iWeaponsSlots[iCswId];
+    }
+
+    const XTRA_OFS_PLAYER = 5;
+    const m_rgpPlayerItems_Slot0 = 367;
+
+    iWeapon = get_pdata_cbase(id, m_rgpPlayerItems_Slot0 + iSlot, XTRA_OFS_PLAYER);
+
+    const XTRA_OFS_WEAPON = 4;
+    const m_pNext = 42;
+    const m_iId = 43;
+
+    while (iWeapon > 0)
+    {
+        if (get_pdata_int(iWeapon, m_iId, XTRA_OFS_WEAPON) == iCswId)
+        {
+            break;
+        }
+        iWeapon = get_pdata_cbase(iWeapon, m_pNext, XTRA_OFS_WEAPON);
+    }
+
+    if (iWeapon > 0)
+    {
+        const m_pActiveItem = 373;
+        if (bSwitchIfActive && get_pdata_cbase(id, m_pActiveItem, XTRA_OFS_PLAYER) == iWeapon)
+        {
+            ExecuteHamB(Ham_Weapon_RetireWeapon, iWeapon);
+        }
+
+        if (ExecuteHamB(Ham_RemovePlayerItem, id, iWeapon))
+        {
+            user_has_weapon(id, iCswId, 0);
+            ExecuteHamB(Ham_Item_Kill, iWeapon);
+            return 1;
+        }
+    }
+
+    return 0;
+}

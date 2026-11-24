@@ -1,0 +1,23 @@
+name = "freenova-panel"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+# Static skin/model preview PNGs live in ./assets (served under /i/...).
+# Optional: drop real skin renders here as <grp>_<index>.png to override
+# the built-in drawn previews (see src/skins.js).
+[assets]
+directory = "./assets"
+binding = "ASSETS"
+
+# D1 binding: create with
+#   npx wrangler d1 create freenova-panel
+# then paste the returned database_id below.
+[[d1_databases]]
+binding = "DB"
+database_name = "freenova-panel"
+database_id = "5ba518cb-74ac-4294-9a22-ae055ece021c"
+
+# Vars
+[vars]
+# SYNC_SECRET is a Wrangler secret, not a plaintext var.
+#   wrangler secret put SYNC_SECRET

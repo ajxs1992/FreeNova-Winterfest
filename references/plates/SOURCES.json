@@ -1,0 +1,128 @@
+[
+  {
+    "normalised": "01-dashboard.png",
+    "original": "FreeNova Winterfest 2026 Dashboard.png",
+    "sha256": "4e9ea10d2fc93059e72137d5c6dc4d5fb0a949e4435eacba4680b32aa40878af",
+    "w": 1672,
+    "h": 941,
+    "bytes": 2417426,
+    "identical_to_repo_copy": true
+  },
+  {
+    "normalised": "02-profile.png",
+    "original": "FreeNova Winterfest Profile Dashboard (1).png",
+    "sha256": "fbc535b16cbbccb2c4161801c9531814e4616ab997562be319f8be4241ac5861",
+    "w": 1672,
+    "h": 941,
+    "bytes": 2362745,
+    "identical_to_repo_copy": true
+  },
+  {
+    "normalised": "03-rankstats.png",
+    "original": "FreeNova Winterfest Rankstats Dashboard.png",
+    "sha256": "c1ee307f1a72cf549bbdbb5ff52e67dd657e54acffb529c9ca2361519c14dc8f",
+    "w": 1672,
+    "h": 941,
+    "bytes": 2309345,
+    "identical_to_repo_copy": true
+  },
+  {
+    "normalised": "04-top15.png",
+    "original": "Winterfest 2026 Top 15 Leaderboard.png",
+    "sha256": "8f4f3497361f3e48fc752d6175dd596ec2439dba204630547f44f9051765dcf4",
+    "w": 1671,
+    "h": 941,
+    "bytes": 2406998,
+    "identical_to_repo_copy": true
+  },
+  {
+    "normalised": "05-battlepass.png",
+    "original": "Winterfest Battle Pass Showcase.png",
+    "sha256": "d32aab17b656406ce24e6f9f0476d91f420578e809bf8c9bf3c9ba0af1947b91",
+    "w": 1672,
+    "h": 941,
+    "bytes": 2317257,
+    "identical_to_repo_copy": true
+  },
+  {
+    "normalised": "06-missions.png",
+    "original": "Winterfest Missions Dashboard.png",
+    "sha256": "eda780d59ed89f9ebd2f5435c6cdb826b41af46fe1eedde02b24cf791c3b9950",
+    "w": 1672,
+    "h": 941,
+    "bytes": 2294975,
+    "identical_to_repo_copy": true
+  },
+  {
+    "normalised": "07-achievements.png",
+    "original": "Winterfest Achievements Dashboard.png",
+    "sha256": "efd6d0817e7acf488341c12c8bc990f3a4d83d3cd148a8de47ed5e65a8c27374",
+    "w": 1672,
+    "h": 941,
+    "bytes": 2376473,
+    "identical_to_repo_copy": true
+  },
+  {
+    "normalised": "08-events.png",
+    "original": "Winterfest Events Dashboard.png",
+    "sha256": "bf25669123fb7488971f1a9c708dea6e02ea4e1172031a6ae33c608fb718673f",
+    "w": 1671,
+    "h": 941,
+    "bytes": 2488479,
+    "identical_to_repo_copy": true
+  },
+  {
+    "normalised": "09-vip.png",
+    "original": "FreeNova Winterfest VIP Dashboard.png",
+    "sha256": "784306dda527dc886d6a9f4ad391df7c9b6e4b9d783527cedb55a70d1f699941",
+    "w": 1671,
+    "h": 941,
+    "bytes": 2395642,
+    "identical_to_repo_copy": true
+  },
+  {
+    "normalised": "10-shop.png",
+    "original": "FreeNova Winterfest Christmas Shop.png",
+    "sha256": "dc97848695947262b6a3bc6cecb79a2e62f1d408eca24ee1b22b13f14b477b53",
+    "w": 1670,
+    "h": 941,
+    "bytes": 2548228,
+    "identical_to_repo_copy": true
+  },
+  {
+    "normalised": "11-advent.png",
+    "original": "Winterfest Advent Calendar Dashboard.png",
+    "sha256": "f5df300c183ab472e2107baba834148e08a5248078f7f56d0c3d98cd89f0a147",
+    "w": 1622,
+    "h": 969,
+    "bytes": 2529289,
+    "identical_to_repo_copy": true
+  },
+  {
+    "normalised": "12-spin.png",
+    "original": "FreeNova Winterfest Spin Wheel.png",
+    "sha256": "a2a134cf3b589ea200090ac7a6fc4c00dfbde7771c1f2dcd0264189e80b4582c",
+    "w": 1672,
+    "h": 941,
+    "bytes": 2540440,
+    "identical_to_repo_copy": true
+  },
+  {
+    "normalised": "13-levels.png",
+    "original": "FreeNova Winterfest Levels Dashboard.png",
+    "sha256": "aa37dc7ef08c59780686c143a3a69ec29fa7ceaa4a43b4ed4fa0d120a3ca2376",
+    "w": 1624,
+    "h": 969,
+    "bytes": 2350985,
+    "identical_to_repo_copy": true
+  },
+  {
+    "normalised": "14-admin.png",
+    "original": "FreeNova Winterfest Admin Panel.png",
+    "sha256": "c5164839cdd64ec2eaefafe36cd391457b11ae189302a92b39e240ad707bc907",
+    "w": 1624,
+    "h": 969,
+    "bytes": 2462415,
+    "identical_to_repo_copy": true
+  }
+]

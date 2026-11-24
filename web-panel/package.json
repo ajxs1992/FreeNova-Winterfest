@@ -1,0 +1,19 @@
+{
+  "name": "freenova-panel",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "FreeNova CS 1.6 web panels (Cloudflare Worker + D1)",
+  "devDependencies": {
+    "sharp": "^0.35.5",
+    "wrangler": "^4.0.0"
+  },
+  "scripts": {
+    "start": "node server_local.mjs",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node test_harness.mjs",
+    "db:init": "wrangler d1 execute freenova-panel --remote --file=schema.sql",
+    "db:init:local": "wrangler d1 execute freenova-panel --local --file=schema.sql"
+  }
+}
